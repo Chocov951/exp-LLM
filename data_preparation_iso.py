@@ -5,6 +5,7 @@ import pickle as pkl
 import nlpaug.augmenter.char as nac
 import nlpaug.augmenter.word as naw
 import nlpaug.augmenter.sentence as nas
+import re
 
 PROMPT1 = """Give me a QUERY that could be answered by the following text:"""
 
@@ -43,14 +44,18 @@ class json_data:
         for query_id, docs in self.qrels_train.items():
             for doc_id in docs:
                 seen_docs.append(doc_id)
-                self.json_train.append(prepared_data(PROMPT1, self.queries_train[query_id], aug.augment(self.corpus_train[doc_id]), "", []).to_dict())
-                self.json_train.append(prepared_data(PROMPT1, self.queries_train[query_id], aug2.augment(self.corpus_train[doc_id]), "", []).to_dict())
-                self.json_train.append(prepared_data(PROMPT1, self.queries_train[query_id], aug3.augment(self.corpus_train[doc_id]), "", []).to_dict())
-        for doc_id in self.corpus_train.keys():
-            if doc_id not in seen_docs:
-                self.json_train.append(prepared_data(PROMPT1, "NONE", aug.augment(self.corpus_train[doc_id]), "", []).to_dict())
-                self.json_train.append(prepared_data(PROMPT1, "NONE", aug2.augment(self.corpus_train[doc_id]), "", []).to_dict())
-                self.json_train.append(prepared_data(PROMPT1, "NONE", aug3.augment(self.corpus_train[doc_id]), "", []).to_dict())
+                text = self.corpus_train[doc_id]
+                text = re.sub(r'\d+', '', text) # remove numbers from text
+                self.json_train.append(prepared_data(PROMPT1, self.queries_train[query_id], aug.augment(text)[0], "", []).to_dict())
+                self.json_train.append(prepared_data(PROMPT1, self.queries_train[query_id], aug2.augment(text)[0], "", []).to_dict())
+                self.json_train.append(prepared_data(PROMPT1, self.queries_train[query_id], aug3.augment(text)[0], "", []).to_dict())
+        # for doc_id in self.corpus_train.keys():
+        #     if doc_id not in seen_docs:
+        #         text = self.corpus_train[doc_id]
+        #         text = re.sub(r'\d+', '', text) # remove numbers from text
+        #         self.json_train.append(prepared_data(PROMPT1, "NONE", aug.augment(text)[0], "", []).to_dict())
+        #         self.json_train.append(prepared_data(PROMPT1, "NONE", aug2.augment(text)[0], "", []).to_dict())
+        #         self.json_train.append(prepared_data(PROMPT1, "NONE", aug3.augment(text)[0], "", []).to_dict())
 
         
         
@@ -63,15 +68,15 @@ class json_data:
             for doc_id in docs:
                 seen_docs.append(doc_id)
                 self.json_dev.append(prepared_data(PROMPT1, self.queries_test[query_id], self.corpus_test[doc_id], "", []).to_dict())
-        for doc_id in self.corpus_test.keys():
-            if doc_id not in seen_docs:
-                self.json_dev.append(prepared_data(PROMPT1, "NONE", self.corpus_test[doc_id], "", []).to_dict())
+        # for doc_id in self.corpus_test.keys():
+        #     if doc_id not in seen_docs:
+        #         self.json_dev.append(prepared_data(PROMPT1, "NONE", self.corpus_test[doc_id], "", []).to_dict())
 
 
 if __name__ == '__main__':
     import nltk
     nltk.download('omw-1.4')
-    dataset = 'iso_none'
+    dataset = 'iso'
     jd = json_data(dataset)
     jd.load_dataset()
     jd.augment_data()
