@@ -5,6 +5,9 @@
     "nfcorpus": {
       "file_name": "/lustre/fswork/projects/rech/ahw/uep39vh/llm_dataset/nfcorpus_train.json"
     },
+    "iso27001": {
+      "file_name": "/lustre/fswork/projects/rech/ahw/uep39vh/llm_dataset/iso_train.json"
+    },
     "identity": {
       "file_name": "identity.json"
     },
