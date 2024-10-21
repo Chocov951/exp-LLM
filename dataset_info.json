@@ -8,6 +8,9 @@
     "iso27001": {
       "file_name": "/lustre/fswork/projects/rech/ahw/uep39vh/llm_dataset/iso_train.json"
     },
+    "iso_none": {
+      "file_name": "/lustre/fswork/projects/rech/ahw/uep39vh/llm_dataset/iso_none_train.json"
+    },
     "identity": {
       "file_name": "identity.json"
     },
