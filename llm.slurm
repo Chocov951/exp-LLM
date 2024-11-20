@@ -19,6 +19,5 @@ module load pytorch-gpu/py3/2.3.0
 conda activate llama
  
 set -x
- 
-srun llamafactory-cli train train_llm_bloom.json
-srun python -u test_llm.py --model_name bloom --dataset scifact
+
+srun python -u llm_train_test.py --train True --overwrite_output_dir True --model_name bloom --dataset scifact --epochs 50 --gradient_accumulation_steps 1 --learning_rate 5e-5
