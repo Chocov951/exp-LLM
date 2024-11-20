@@ -1,0 +1,14 @@
+requests
+PyPDF2
+fitz
+tqdm
+datasets
+transformers
+peft
+ranx
+trl
+beir
+nlpaug
+pandas
+dash
+plotly
