@@ -28,7 +28,7 @@ class json_data:
         self.qrels_test = {}
     
     def load_dataset(self):
-        data_path = os.path.join("datasets", self.dataset)
+        data_path = f"{self.dataset}"
         self.corpus_train, self.queries_train, self.qrels_train = GenericDataLoader(data_path).load(split="train")
         self.corpus_test, self.queries_test, self.qrels_test = GenericDataLoader(data_path).load(split="test")
         
@@ -41,11 +41,13 @@ class json_data:
                 self.json_dev.append(prepared_data(PROMPT1, self.queries_test[query_id], self.corpus_test[doc_id]['text'], "", []).to_dict())
 
 if __name__ == '__main__':
-    dataset = 'scifact'
+    dataset = 'hal'
     jd = json_data(dataset)
     jd.load_dataset()
     jd.prepare_data()
-    with open(f"{dataset}_dev.json", "w", encoding="utf-8") as f:
+    if not os.path.exists(dataset):
+        os.makedirs(dataset)
+    with open(f"{dataset}/{dataset}_dev.json", "w", encoding="utf-8") as f:
         json.dump(jd.json_dev, f, indent=2, ensure_ascii=False)
-    with open(f"{dataset}_train.json", "w", encoding="utf-8") as f:
+    with open(f"{dataset}/{dataset}_train.json", "w", encoding="utf-8") as f:
         json.dump(jd.json_train, f, indent=2, ensure_ascii=False)
