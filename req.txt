@@ -12,3 +12,4 @@ nlpaug
 pandas
 dash
 plotly
+frontend
