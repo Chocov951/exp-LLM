@@ -12,6 +12,7 @@ from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
 from trl.trainer import ConstantLengthDataset
 import string
 import pickle as pkl
+from beir.datasets.data_loader import GenericDataLoader
 
 SEPARATOR = "### Answer:\n"
 
@@ -227,9 +228,7 @@ if __name__ == '__main__':
     full_results = []
     jaccard_results = []
     rundict = {}
-    corpus_test, queries_test, qrels_test = pkl.load(open(f"dataset_iso.pkl", "rb"))
-    for k, v in qrels_test.items():
-        qrels_test[k] = {str(list(v.keys())[0]): 1}
+    corpus_test, queries_test, qrels_test = GenericDataLoader(f"datasets/{dataset}").load(split="test")
 
     if use_peft:
         model = model_class.from_pretrained(model_path)
@@ -256,8 +255,8 @@ if __name__ == '__main__':
         full_results.append({'jaccard': jsim, 'expected': raw_data['output'], 'full_response': response})
         jaccard_results.append(jsim)
 
-        if response != 'NONE' and dataset == 'iso_none':
-            did = [i for i in corpus_test.keys() if corpus_test[i]==raw_data['input']][0]
+        if response != 'NONE':
+            did = [i for i in corpus_test.keys() if corpus_test[i]['text']==raw_data['input']][0]
             jacc_tab = [(k,jaccard_similarity(preprocess(queries_test[k]), pred)) for k in queries_test.keys()]
             jacc_tab = sorted(jacc_tab, key=lambda x: x[1], reverse=True)
             qid = str(jacc_tab[0][0])
@@ -272,17 +271,19 @@ if __name__ == '__main__':
     non_null_jaccard = sorted([x for x in full_results], key=lambda x: x['jaccard'], reverse=True)
     print("Non null Jaccard: \n", non_null_jaccard)
 
-    if dataset == 'iso_none':
-        # Evaluate with ranx
-        print("\n\n")
-        print(qrels_test)
-        print(rundict)
-        print("\n\n")
-        qrels = Qrels(qrels_test)
-        run = Run(rundict)
-        results = evaluate(qrels, run, ['recall@1', 'recall@2', 'recall@3', 'recall@4', 'recall@5',
-                                        'ndcg@1', 'ndcg@2', 'ndcg@3', 'ndcg@4', 'ndcg@5'], make_comparable=True)
-        print(results)
+    
+    # Evaluate with ranx
+    print("\n\n")
+    print(qrels_test)
+    print(rundict)
+    print("\n\n")
+    qrels = Qrels(qrels_test)
+    run = Run(rundict)
+    results = evaluate(qrels, run, ['recall@1', 'recall@2', 'recall@3', 'recall@4', 'recall@5',
+                                    'ndcg@1', 'ndcg@2', 'ndcg@3', 'ndcg@4', 'ndcg@5',
+                                    'precision@1'],
+                                      make_comparable=True)
+    print(results)
     
     with open(f'json/res_{dataset}-{model_name}-{args.epochs}ep-{args.learning_rate}lr.json', mode='w', encoding='utf-8') as f:
         json.dump(full_results, f, indent=2, ensure_ascii=False)

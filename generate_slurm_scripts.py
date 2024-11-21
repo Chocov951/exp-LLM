@@ -3,7 +3,7 @@ import os
 # Définir les plages de paramètres
 learning_rates = [1e-5, 5e-5, 1e-4]
 epochs = [40]
-datasets = ["iso_none"]
+datasets = ["hal"]
 model_names = ["bloom", "bloomz560", "llama"]
 save_steps = 1 # Fréquence de sauvegarde du modèle en nombre d'époques
 steps_per_epoch = 189 # Nombre de pas par époque
