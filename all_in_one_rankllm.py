@@ -31,24 +31,37 @@ import csv
 # Try to import rank_llm components - will handle gracefully if not installed
 RANK_LLM_AVAILABLE = False
 try:
-    from rank_llm.retrieve.pyserini_retriever import PyseriniRetriever
-    from rank_llm.retrieve.retriever import Request, Candidate
-    from rank_llm.rerank.rank_gpt import SafeOpenai
-    from rank_llm.rerank.listwise import ListwiseRankLLM
+    from rank_llm.data import Request, Query, Candidate, Result
+    from rank_llm.rerank.listwise import (
+        SafeOpenai,
+        VicunaReranker,
+        ZephyrReranker,
+        RankListwiseOSLLM,
+    )
+    from rank_llm.rerank.pointwise import PointwiseRankLLM
     from rank_llm.rerank.rankllm import PromptMode
     RANK_LLM_AVAILABLE = True
 except ImportError:
     print("Warning: rank_llm not fully installed. Will use fallback implementations.")
-    # Define minimal Request and Candidate classes for compatibility
-    class Candidate:
-        def __init__(self, docid, text, score=0.0):
-            self.docid = docid
+    # Define minimal classes for compatibility
+    class Query:
+        def __init__(self, text, qid):
             self.text = text
+            self.qid = qid
+    
+    class Candidate:
+        def __init__(self, docid, score=0.0, doc=None):
+            self.docid = docid
             self.score = score
+            self.doc = doc if doc is not None else {}
     
     class Request:
-        def __init__(self, qid, query, candidates):
-            self.qid = qid
+        def __init__(self, query, candidates):
+            self.query = query
+            self.candidates = candidates
+    
+    class Result:
+        def __init__(self, query, candidates):
             self.query = query
             self.candidates = candidates
 
@@ -292,6 +305,9 @@ class RankingStage:
         self.tokenizer = None
         self.model = None
         self.pipe = None
+        
+        # RankLLM rerankers
+        self.rankllm_reranker = None
 
         self.ranking_time = 0
         self.ranking_count = 0
@@ -309,6 +325,10 @@ class RankingStage:
                 self.max_length = shared_custom_llm.get("max_length")
             else:
                 self._init_custom_llm()
+        elif self.ranking_method == "rankllm_listwise":
+            self._init_rankllm_listwise()
+        elif self.ranking_method == "rankllm_pointwise":
+            self._init_rankllm_pointwise()
 
     def _init_custom_llm(self):
         """Initialize custom LLM model for ranking."""
@@ -330,6 +350,91 @@ class RankingStage:
             tokenizer=self.tokenizer,
         )
         print("Custom LLM (ranking) loaded successfully")
+    
+    def _init_rankllm_listwise(self):
+        """Initialize RankLLM listwise reranker."""
+        if not RANK_LLM_AVAILABLE:
+            print("Warning: rank_llm not available, cannot initialize listwise reranker")
+            return
+        
+        print(f"Loading RankLLM listwise reranker: {self.args.rankllm_model}")
+        try:
+            # Use ZephyrReranker by default, which is a popular choice
+            # Users can modify this to use VicunaReranker or other models
+            if "zephyr" in self.args.rankllm_model.lower():
+                self.rankllm_reranker = ZephyrReranker(
+                    model_path=self.args.rankllm_model,
+                    context_size=4096,
+                    num_gpus=1,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    window_size=20,
+                    stride=10,
+                )
+            elif "vicuna" in self.args.rankllm_model.lower():
+                self.rankllm_reranker = VicunaReranker(
+                    model_path=self.args.rankllm_model,
+                    context_size=4096,
+                    num_gpus=1,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    window_size=20,
+                    stride=10,
+                )
+            else:
+                # Generic listwise reranker
+                self.rankllm_reranker = RankListwiseOSLLM(
+                    model=self.args.rankllm_model,
+                    context_size=4096,
+                    num_gpus=1,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    window_size=20,
+                    stride=10,
+                )
+            print("RankLLM listwise reranker loaded successfully")
+        except Exception as e:
+            print(f"Error initializing RankLLM listwise reranker: {e}")
+            print("Falling back to custom LLM")
+            self.rankllm_reranker = None
+    
+    def _init_rankllm_pointwise(self):
+        """Initialize RankLLM pointwise reranker."""
+        if not RANK_LLM_AVAILABLE:
+            print("Warning: rank_llm not available, cannot initialize pointwise reranker")
+            return
+        
+        print(f"Loading RankLLM pointwise reranker: {self.args.rankllm_model}")
+        try:
+            # PointwiseRankLLM for pointwise ranking
+            self.rankllm_reranker = PointwiseRankLLM(
+                model=self.args.rankllm_model,
+                context_size=4096,
+                num_gpus=1,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            print("RankLLM pointwise reranker loaded successfully")
+        except Exception as e:
+            print(f"Error initializing RankLLM pointwise reranker: {e}")
+            print("Falling back to custom LLM")
+            self.rankllm_reranker = None
+
+    def _convert_to_rankllm_request(self, query: str, passages: Dict[str, str], qid: str) -> 'Request':
+        """Convert internal format to RankLLM Request format."""
+        query_obj = Query(text=query, qid=qid)
+        candidates = []
+        for doc_id, text in passages.items():
+            candidates.append(Candidate(
+                docid=doc_id,
+                score=0.0,
+                doc={"text": text, "title": ""}
+            ))
+        return Request(query=query_obj, candidates=candidates)
+    
+    def _convert_from_rankllm_result(self, result: 'Result') -> Dict[str, float]:
+        """Convert RankLLM Result back to internal format."""
+        reranked_dict = {}
+        for rank, candidate in enumerate(result.candidates):
+            # Higher score for higher rank (inverse of position)
+            reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
+        return reranked_dict
 
     def rank(self, query: str, filtered_passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Run the ranking stage and return rank scores."""
@@ -338,9 +443,9 @@ class RankingStage:
         if self.ranking_method == "custom_llm":
             result = self._rank_custom_llm(query, filtered_passages)
         elif self.ranking_method == "rankllm_listwise":
-            result = self._rank_rankllm_listwise(query, filtered_passages)
+            result = self._rank_rankllm_listwise(query, filtered_passages, qid)
         elif self.ranking_method == "rankllm_pointwise":
-            result = self._rank_rankllm_pointwise(query, filtered_passages)
+            result = self._rank_rankllm_pointwise(query, filtered_passages, qid)
         else:
             raise ValueError(f"Unknown ranking method: {self.ranking_method}")
 
@@ -377,23 +482,93 @@ class RankingStage:
             print(f"Error in custom LLM ranking: {e}")
             return {}
 
-    def _rank_rankllm_listwise(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
+    def _rank_rankllm_listwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Rank using rank_llm listwise ranker."""
-        if not RANK_LLM_AVAILABLE:
+        if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
             print("Warning: rank_llm not available, falling back to custom LLM")
             return self._rank_custom_llm(query, passages)
 
-        print("RankLLM listwise ranking not yet fully implemented")
-        return self._rank_custom_llm(query, passages)
+        try:
+            # Convert to RankLLM format
+            request = self._convert_to_rankllm_request(query, passages, qid)
+            
+            # Rerank using RankLLM
+            result = self.rankllm_reranker.rerank(
+                request=request,
+                rank_start=0,
+                rank_end=len(passages)
+            )
+            
+            # Convert back to our format
+            return self._convert_from_rankllm_result(result)
+        except Exception as e:
+            print(f"Error in RankLLM listwise ranking: {e}")
+            print("Falling back to custom LLM")
+            return self._rank_custom_llm(query, passages)
 
-    def _rank_rankllm_pointwise(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
+    def _rank_rankllm_pointwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Rank using rank_llm pointwise ranker."""
-        if not RANK_LLM_AVAILABLE:
+        if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
             print("Warning: rank_llm not available, falling back to custom LLM")
             return self._rank_custom_llm(query, passages)
 
-        print("RankLLM pointwise ranking not yet fully implemented")
-        return self._rank_custom_llm(query, passages)
+        try:
+            # Convert to RankLLM format
+            request = self._convert_to_rankllm_request(query, passages, qid)
+            
+            # Rerank using RankLLM
+            result = self.rankllm_reranker.rerank(
+                request=request,
+                rank_start=0,
+                rank_end=len(passages)
+            )
+            
+            # Convert back to our format
+            return self._convert_from_rankllm_result(result)
+        except Exception as e:
+            print(f"Error in RankLLM pointwise ranking: {e}")
+            print("Falling back to custom LLM")
+            return self._rank_custom_llm(query, passages)
+
+
+class TwoStageRanker:
+    """
+    Combined two-stage ranker for compatibility.
+    Combines FilterStage and RankingStage into a single interface.
+    """
+    def __init__(self, args, prompts: Dict[str, str]):
+        self.args = args
+        self.prompts = prompts
+        self.filter_stage = FilterStage(args, prompts)
+        self.ranking_stage = RankingStage(args, prompts, self.filter_stage.export_shared_llm())
+    
+    def two_stage_rerank(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
+        """
+        Run complete two-stage reranking.
+        
+        Args:
+            query: Query text
+            passages: Dict of {doc_id: passage_text}
+            qid: Query ID
+            
+        Returns:
+            Dict of {doc_id: final_score}
+        """
+        # Stage 1: Filter
+        filter_scores = self.filter_stage.filter(query, passages, qid)
+        if not filter_scores:
+            return {}
+        
+        # Get top-k from filter stage
+        sorted_filtered = sorted(filter_scores.items(), key=lambda x: x[1], reverse=True)
+        top_k_passages = {pid: passages[pid] for pid, _ in sorted_filtered[:self.args.filter_topk] if pid in passages}
+        
+        if not top_k_passages:
+            return {}
+        
+        # Stage 2: Rank
+        final_scores = self.ranking_stage.rank(query, top_k_passages, qid)
+        return final_scores
 
 
 def load_bm25_results(dataset: str, bm25_topk: int) -> Tuple[Dict, Dict]:
