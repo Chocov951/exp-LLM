@@ -1,0 +1,33 @@
+# Requirements for all_in_one_rankllm.py
+# Full ranking evaluation pipeline with two-stage strategy
+
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+tqdm>=4.65.0
+
+# Ranking and retrieval
+# Note: rank_llm may need to be installed from source
+# git+https://github.com/castorini/rank_llm.git
+pyserini>=0.20.0
+ranx>=0.3.0
+beir>=1.0.0
+
+# Environmental tracking
+codecarbon>=2.1.0
+
+# Model optimization
+bitsandbytes>=0.41.0  # For 8-bit quantization
+accelerate>=0.20.0    # For multi-GPU support
+
+# Data processing
+datasets>=2.10.0
+scikit-learn>=1.2.0
+
+# Optional: BERT models for filtering
+sentence-transformers>=2.2.0
+
+# Development
+pytest>=7.0.0
+black>=23.0.0
+flake8>=6.0.0
