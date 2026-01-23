@@ -6,6 +6,8 @@ This guide explains how to integrate the [rank_llm library](https://github.com/c
 
 **Yes, it is possible to use rank_llm models in the same way you do in `all_in_one.py`!** This guide shows you exactly how.
 
+> **⚠️ Important Note**: This guide provides conceptual examples based on the typical structure of the rank_llm library. The exact API calls, import paths, and parameter names should be verified against the actual rank_llm library documentation and source code at https://github.com/castorini/rank_llm. The library may have different method signatures or module structures. Always consult the official documentation for the most up-to-date API details.
+
 ---
 
 ## Table of Contents
@@ -97,17 +99,50 @@ from rank_llm.rankers import (
 
 ## Integration Steps
 
+### Step 0: Verify rank_llm API Structure (Important!)
+
+Before following the integration steps, inspect the actual rank_llm library structure:
+
+```bash
+# After installing rank_llm
+python -c "import rank_llm; help(rank_llm)"
+
+# Check available modules
+python -c "import rank_llm; print(dir(rank_llm))"
+
+# Inspect ranker classes
+python -c "from rank_llm import rankers; print(dir(rankers))"
+
+# Or explore the source code
+cd /path/to/rank_llm
+find . -name "*.py" | head -20
+grep -r "class.*Ranker" --include="*.py"
+```
+
+This will help you verify:
+- Correct import paths
+- Available ranker classes
+- Constructor parameters
+- Method signatures
+
+The examples in this guide use common patterns but **must be adapted** to match the actual API.
+
 ### Step 1: Install rank_llm
 
 ```bash
-# Install from PyPI
+# Option 1: Install from PyPI (if available)
+# Note: Verify the correct package name on PyPI
 pip install rank-llm
+# OR
+pip install rank_llm
 
-# Or install from source for latest features
+# Option 2: Install from source (recommended for latest features)
 git clone https://github.com/castorini/rank_llm.git
 cd rank_llm
 pip install -e .
 ```
+
+> **Note**: The exact package name may vary. Check https://pypi.org or the official repository for the correct installation command.
 
 **Dependencies** (check compatibility):
 ```bash
@@ -154,8 +189,15 @@ Create a new file `rank_llm_integration.py`:
 ```python
 import os
 from typing import Dict, List
-from rank_llm.rankers import ListwiseRanker
-from rank_llm.retrieval import Request, Candidate
+
+# Note: Verify these import paths against the actual rank_llm library
+# They may be different depending on the library version
+try:
+    from rank_llm.rankers import ListwiseRanker
+    from rank_llm.retrieval import Request, Candidate
+except ImportError:
+    # Alternative import paths - check the library structure
+    from rank_llm import ListwiseRanker, Request, Candidate
 
 def convert_to_ranklist(qid, query, passages_dict):
     """
@@ -168,9 +210,14 @@ def convert_to_ranklist(qid, query, passages_dict):
     
     Returns:
         Request object for rank_llm
+    
+    Note: Verify Candidate constructor parameters with the actual API.
+    Common variations: docid/doc_id, score/rank, text/content
     """
     candidates = [
+        # Adjust parameter names based on actual API
         Candidate(docid=doc_id, text=passage_text, score=0.0)
+        # Alternative: Candidate(doc_id=doc_id, content=passage_text, score=0.0)
         for doc_id, passage_text in passages_dict.items()
     ]
     
@@ -200,9 +247,17 @@ def convert_from_ranklist(request):
 Choose the appropriate ranker for your use case:
 
 ```python
-from rank_llm.rankers import create_ranker
+# Note: Verify the exact import paths and API with the rank_llm documentation
+# The structure below is conceptual and may need adjustment
+
+try:
+    from rank_llm.rankers import create_ranker
+except ImportError:
+    # Alternative: the library may use a different structure
+    from rank_llm import create_ranker
 
 # Option A: Use a Hugging Face model (similar to your current approach)
+# Verify parameter names with actual API documentation
 ranker = create_ranker(
     model_name="castorini/rankllama-v1-7b-lora-passage",  # or your model
     context_size=4096,
@@ -212,7 +267,10 @@ ranker = create_ranker(
 )
 
 # Option B: Use your existing models with rank_llm infrastructure
-from rank_llm.rankers.listwise import ListwiseRanker
+try:
+    from rank_llm.rankers.listwise import ListwiseRanker
+except ImportError:
+    from rank_llm.rankers import ListwiseRanker
 
 ranker = ListwiseRanker(
     model="models/Qwen2.5-3B-Instruct",  # Your local model path
@@ -222,6 +280,8 @@ ranker = ListwiseRanker(
     batch_size=1
 )
 ```
+
+> **⚠️ API Verification Required**: The exact constructor parameters (model vs model_name, context_size vs max_length, etc.) should be verified against the rank_llm source code or documentation.
 
 ### Step 5: Implement Two-Stage Ranking with rank_llm
 
@@ -837,10 +897,30 @@ All approaches are valid and can maintain the methodology described in your pape
 
 ## References
 
-- [rank_llm GitHub Repository](https://github.com/castorini/rank_llm)
-- [rank_llm Documentation](https://github.com/castorini/rank_llm#readme)
+- [rank_llm GitHub Repository](https://github.com/castorini/rank_llm) - **Start here for official documentation**
+- [rank_llm Source Code](https://github.com/castorini/rank_llm/tree/main) - Verify API structure
+- [Castorini Papers](https://github.com/castorini) - Related research
 - Your Paper: `Paper_ECIR.pdf`
 - Your Implementation: `all_in_one.py`
+
+### How to Verify the API
+
+Since the exact rank_llm API may differ from this guide's examples:
+
+1. **Read the official README**: https://github.com/castorini/rank_llm#readme
+2. **Check example scripts**: Look for `examples/` or `scripts/` in the repo
+3. **Inspect source code**: Browse the Python files to see actual class definitions
+4. **Run help()**: Use Python's built-in help to explore the API
+5. **Check tests**: Unit tests often show correct usage patterns
+
+```bash
+# Example: Finding the correct API
+git clone https://github.com/castorini/rank_llm.git
+cd rank_llm
+cat README.md  # Read usage instructions
+ls examples/   # Look for example scripts
+grep -r "def rerank" --include="*.py"  # Find rerank methods
+```
 
 ---
 
