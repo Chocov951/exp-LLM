@@ -1,4 +1,11 @@
-iso_entreprise/*
-*.pyc
-results/*
-hal/*
+dora/
+hal/
+hal_bio/
+hal_fr/
+hal_test/
+iso_entreprise/
+Llama/
+old/
+paper/
+results/
+__pycache__/

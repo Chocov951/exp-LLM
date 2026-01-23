@@ -1,0 +1,23 @@
+Notes review paper
+
+abstract :
+On finetune un reranker pour mieux trouver des documents, grace à un dataset construit
+
+1 Intro :
+prez de la problématique + prez des travaux
+2x enfin fin d'intro
+
+2 Contexte : 
+Présentation claire du domaine de recherche
+
+3 Etat de l'art :
+3.1 présentation succincte des méthodes de reranking : Bi-encoder/CrossEncoder - LLM
+
+4 Expe :
+4.1 Création du dataset :  mélange de dataset de paires de phrases et de questions réponses. sélection des données en fr, sélection de paires positives, création de paires négatives, et fusion structurée de tous les datasets. conservation du split train test
+4.2 : 4 expé combinants 2 modèles et diff datasets. Fixage des paramètres pour toutes les expés. présentations des évaluateurs selon les données
+4.3 Tableaux de résultats
+4.4 Etude comparative des résultats qui montrent l'intérêt de combiner des jeux de données hétérogènes pour augmenter la stabilité et l'adaptabilité du modèle finetuné.
+
+5 Benchmark :
+5.1
