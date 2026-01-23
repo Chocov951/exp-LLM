@@ -148,7 +148,7 @@ class TwoStageRanker:
             self._init_bert_model()
         elif self.filter_method == "rankT5":
             # RankT5 would be loaded from rank_llm if available
-            if RANK_llm_AVAILABLE:
+            if RANK_LLM_AVAILABLE:
                 print("RankT5 initialization would go here")
             else:
                 print("Warning: RankT5 requires rank_llm library")
@@ -431,9 +431,9 @@ def evaluate_metrics(qrels: Dict, run: Dict) -> Dict:
     """Evaluate ranking metrics."""
     metrics = [
         'ndcg@1', 'ndcg@3', 'ndcg@5', 'ndcg@10', 'ndcg@20',
-        'recall@1', 'recall@5', 'recall@10', 'recall@20', 'recall@100',
-        'mrr@10', 'mrr@100',
-        'precision@1', 'precision@5', 'precision@10'
+        'recall@1', 'recall@5', 'recall@10', 'recall@20', 'recall@50',
+        'mrr@10', 'mrr@20',
+        'precision@1', 'precision@5', 'precision@10', 'precision@20', 'precision@50'
     ]
     
     try:
@@ -454,8 +454,7 @@ def save_results(args, metrics_dict: Dict, codecarbon_metrics: Dict, output_dir:
         f"{args.model_name}_"
         f"filter-{args.filter_method}_"
         f"rank-{args.ranking_method}_"
-        f"topk{args.bm25_topk}_"
-        f"filtertopk{args.filter_topk}_"
+        f"topk{args.filter_topk}_"
         f"results.json"
     )
     
@@ -548,7 +547,7 @@ def main():
     
     filter_emissions_file = (
         f"emissions_filter_{args.dataset}_{args.filter_method}_"
-        f"topk{args.bm25_topk}.csv"
+        f"topk{args.filter_topk}.csv"
     )
     ranking_emissions_file = (
         f"emissions_ranking_{args.dataset}_{args.ranking_method}_"
@@ -680,14 +679,14 @@ def main():
     
     results_file = save_results(args, all_metrics, codecarbon_metrics, args.output_dir)
     
-    print("\n" + "="*80)
+    print("\n" + "="*20)
     print("EVALUATION COMPLETE")
-    print("="*80)
+    print("="*20)
     print(f"Dataset: {args.dataset}")
     print(f"Filter method: {args.filter_method}")
     print(f"Ranking method: {args.ranking_method}")
     print(f"Results saved to: {results_file}")
-    print("="*80)
+    print("="*20)
 
 
 if __name__ == '__main__':
