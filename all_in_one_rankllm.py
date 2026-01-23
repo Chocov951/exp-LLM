@@ -642,7 +642,8 @@ def main():
     if os.path.exists(filter_csv_path):
         with open(filter_csv_path, 'r') as f:
             reader = csv.DictReader(f)
-            filter_data = list(reader)[-1] if list(reader) else {}
+            reader_list = list(reader)
+            filter_data = reader_list[-1] if reader_list else {}
             codecarbon_metrics['filter'] = {
                 'emissions_kg': float(filter_data.get('emissions', 0)),
                 'energy_consumed_kwh': float(filter_data.get('energy_consumed', 0)),
@@ -652,7 +653,8 @@ def main():
     if os.path.exists(ranking_csv_path):
         with open(ranking_csv_path, 'r') as f:
             reader = csv.DictReader(f)
-            ranking_data = list(reader)[-1] if list(reader) else {}
+            reader_list = list(reader)
+            ranking_data = reader_list[-1] if reader_list else {}
             codecarbon_metrics['ranking'] = {
                 'emissions_kg': float(ranking_data.get('emissions', 0)),
                 'energy_consumed_kwh': float(ranking_data.get('energy_consumed', 0)),
