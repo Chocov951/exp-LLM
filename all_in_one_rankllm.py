@@ -416,6 +416,26 @@ class RankingStage:
             print("Falling back to custom LLM")
             self.rankllm_reranker = None
 
+    def _convert_to_rankllm_request(self, query: str, passages: Dict[str, str], qid: str) -> 'Request':
+        """Convert internal format to RankLLM Request format."""
+        query_obj = Query(text=query, qid=qid)
+        candidates = []
+        for doc_id, text in passages.items():
+            candidates.append(Candidate(
+                docid=doc_id,
+                score=0.0,
+                doc={"text": text, "title": ""}
+            ))
+        return Request(query=query_obj, candidates=candidates)
+    
+    def _convert_from_rankllm_result(self, result: 'Result') -> Dict[str, float]:
+        """Convert RankLLM Result back to internal format."""
+        reranked_dict = {}
+        for rank, candidate in enumerate(result.candidates):
+            # Higher score for higher rank (inverse of position)
+            reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
+        return reranked_dict
+
     def rank(self, query: str, filtered_passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Run the ranking stage and return rank scores."""
         start_time = time.time()
@@ -423,9 +443,9 @@ class RankingStage:
         if self.ranking_method == "custom_llm":
             result = self._rank_custom_llm(query, filtered_passages)
         elif self.ranking_method == "rankllm_listwise":
-            result = self._rank_rankllm_listwise(query, filtered_passages)
+            result = self._rank_rankllm_listwise(query, filtered_passages, qid)
         elif self.ranking_method == "rankllm_pointwise":
-            result = self._rank_rankllm_pointwise(query, filtered_passages)
+            result = self._rank_rankllm_pointwise(query, filtered_passages, qid)
         else:
             raise ValueError(f"Unknown ranking method: {self.ranking_method}")
 
@@ -462,7 +482,7 @@ class RankingStage:
             print(f"Error in custom LLM ranking: {e}")
             return {}
 
-    def _rank_rankllm_listwise(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
+    def _rank_rankllm_listwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Rank using rank_llm listwise ranker."""
         if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
             print("Warning: rank_llm not available, falling back to custom LLM")
@@ -470,16 +490,7 @@ class RankingStage:
 
         try:
             # Convert to RankLLM format
-            query_obj = Query(text=query, qid="temp")
-            candidates = []
-            for doc_id, text in passages.items():
-                candidates.append(Candidate(
-                    docid=doc_id,
-                    score=0.0,
-                    doc={"text": text, "title": ""}
-                ))
-            
-            request = Request(query=query_obj, candidates=candidates)
+            request = self._convert_to_rankllm_request(query, passages, qid)
             
             # Rerank using RankLLM
             result = self.rankllm_reranker.rerank(
@@ -489,18 +500,13 @@ class RankingStage:
             )
             
             # Convert back to our format
-            reranked_dict = {}
-            for rank, candidate in enumerate(result.candidates):
-                # Higher score for higher rank (inverse of position)
-                reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
-            
-            return reranked_dict
+            return self._convert_from_rankllm_result(result)
         except Exception as e:
             print(f"Error in RankLLM listwise ranking: {e}")
             print("Falling back to custom LLM")
             return self._rank_custom_llm(query, passages)
 
-    def _rank_rankllm_pointwise(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
+    def _rank_rankllm_pointwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Rank using rank_llm pointwise ranker."""
         if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
             print("Warning: rank_llm not available, falling back to custom LLM")
@@ -508,16 +514,7 @@ class RankingStage:
 
         try:
             # Convert to RankLLM format
-            query_obj = Query(text=query, qid="temp")
-            candidates = []
-            for doc_id, text in passages.items():
-                candidates.append(Candidate(
-                    docid=doc_id,
-                    score=0.0,
-                    doc={"text": text, "title": ""}
-                ))
-            
-            request = Request(query=query_obj, candidates=candidates)
+            request = self._convert_to_rankllm_request(query, passages, qid)
             
             # Rerank using RankLLM
             result = self.rankllm_reranker.rerank(
@@ -527,12 +524,7 @@ class RankingStage:
             )
             
             # Convert back to our format
-            reranked_dict = {}
-            for rank, candidate in enumerate(result.candidates):
-                # Higher score for higher rank (inverse of position)
-                reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
-            
-            return reranked_dict
+            return self._convert_from_rankllm_result(result)
         except Exception as e:
             print(f"Error in RankLLM pointwise ranking: {e}")
             print("Falling back to custom LLM")
