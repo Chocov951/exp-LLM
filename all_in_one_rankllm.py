@@ -27,7 +27,6 @@ from pyserini.search.lucene import LuceneSearcher
 from ranx import Qrels, Run, evaluate
 import csv
 
-
 # Try to import rank_llm components - will handle gracefully if not installed
 RANK_LLM_AVAILABLE = False
 try:
@@ -38,9 +37,13 @@ try:
         ZephyrReranker,
         RankListwiseOSLLM,
     )
+    from rank_llm.rerank.pointwise.monot5 import MonoT5
     from rank_llm.rerank.pointwise import PointwiseRankLLM
     from rank_llm.rerank.rankllm import PromptMode
     RANK_LLM_AVAILABLE = True
+    CONTEXT_SIZE = 32768
+    NUM_GPUS = 2
+
 except ImportError:
     print("Warning: rank_llm not fully installed. Will use fallback implementations.")
     # Define minimal classes for compatibility
@@ -73,8 +76,8 @@ def get_args():
     # Dataset and model configuration
     parser.add_argument("--dataset", type=str, default="scifact", 
                        help="Dataset to test (scifact, trec-covid, fiqa, etc.)")
-    parser.add_argument("--model_name", type=str, default="qwen3",
-                       choices=["qwen3", "qwen14", "qwen32", "qwen72", "calme", "llama", "mistral"],
+    parser.add_argument("--custom_model", type=str, default=None,
+                       choices=["qwen4", "qwen30", None],
                        help="Model to use for custom LLM ranking")
     parser.add_argument("--bm25_topk", type=int, default=100,
                        help="Top-k documents from BM25 to rerank")
@@ -86,53 +89,87 @@ def get_args():
     parser.add_argument("--filter_topk", type=int, default=10,
                        help="Number of passages to keep after filter stage")
     parser.add_argument("--ranking_method", type=str, default="custom_llm",
-                       choices=["custom_llm", "rankllm_listwise", "rankllm_pointwise"],
+                       choices=["custom_llm", "listwise"],
                        help="Method for ranking stage")
-    parser.add_argument("--stage", type=str, default="both",
+    parser.add_argument("--stage", type=str, default="both", # If only rerank is selected and no filtered rundict is provided, will single-pass rerank BM25 results
                        choices=["filter", "rerank", "both"],
                        help="Select which stage(s) to run: filter only, rerank only, or both")
-    parser.add_argument("--filtered_rundict", type=str, default=None,
-                       help="Path to precomputed filtered rundict JSON for reranking stage")
-    parser.add_argument("--filtered_output", type=str, default=None,
-                       help="Path to save filtered rundict JSON when running filter stage")
+    parser.add_argument("--load_filtered_rundict", action="store_true",
+                       help="Load precomputed filtered rundict with filter args instead of running filter stage")
     
     # RankLLM specific options
-    parser.add_argument("--rankllm_model", type=str, default="castorini/rank_zephyr_7b_v1_full",
+    parser.add_argument("--listwise_model", type=str, default="zephyr",
+                       choices=["zephyr", "vicuna", "custom_llm"],
                        help="RankLLM model name if using rankllm methods")
-    parser.add_argument("--bert_model", type=str, default="BAAI/bge-m3",
+    parser.add_argument("--listwise_window_size", type=lambda x: x if x == "full" else int(x), default=20,
+                        help="Window size for RankLLM listwise reranker")
+    parser.add_argument("--listwise_stride", type=int, default=10,
+                        help="Stride for RankLLM listwise reranker")
+    parser.add_argument("--bert_model", type=str, default="bge-m3",
                        help="BERT model for BERT index filtering")
     
     # Output configuration
     parser.add_argument("--output_dir", type=str, default="rankllm_results",
                        help="Directory to save results")
-    parser.add_argument("--use_cache", action="store_true",
-                       help="Use cached results if available")
     
     return parser.parse_args()
 
 
 def create_model_config(model_name: str) -> Tuple[str, int, Optional[BitsAndBytesConfig]]:
     """Create model configuration based on model name."""
+
     model_configs = {
-        'qwen3': ('models/Qwen2.5-3B-Instruct', 32768, True),
-        'qwen14': ('models/Qwen2.5-14B-Instruct', 32768, True),
-        'qwen32': ('models/Qwen2.5-32B-Instruct', 32768, True),
-        'qwen72': ('models/Qwen2.5-72B-Instruct', 32768, True),
-        'calme': ('models/calme-3.1-instruct-78b', 32768, True),
-        'llama': ('models/llama-3.3-70B-Instruct', 32768, True),
-        'mistral': ('models/Mistral-Small-3.1-24B-Instruct-2503', 32768, True),
+        'qwen4': ('Qwen3-4B-Instruct-2507', CONTEXT_SIZE, True),
+        'qwen30': ('Qwen3-30B-A3B-Instruct-2507', CONTEXT_SIZE, True),
     }
     
     if model_name not in model_configs:
         raise ValueError(f"Model {model_name} not supported")
     
     model_path, max_length, use_quant = model_configs[model_name]
+    # Local model directory
+    llm_root = os.environ.get("LLM_MODELS_ROOT")
+    if llm_root:
+        model_path = os.path.join(llm_root, model_path)
+    else:
+        model_path = os.path.join("models", model_path)
     
     quantization_config = None
     if use_quant:
         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     
     return model_path, max_length, quantization_config
+
+
+# ========================================
+# RankLLM utils
+# ========================================
+
+
+def _convert_to_rankllm_request(self, query: str, passages: Dict[str, str], qid: str) -> 'Request':
+    """Convert internal format to RankLLM Request format."""
+    query_obj = Query(text=query, qid=qid)
+    candidates = []
+    for doc_id, text in passages.items():
+        candidates.append(Candidate(
+            docid=doc_id,
+            score=0.0,
+            doc={"text": text, "title": ""}
+        ))
+    return Request(query=query_obj, candidates=candidates)
+
+def _convert_from_rankllm_result(self, result: 'Result') -> Dict[str, float]:
+    """Convert RankLLM Result back to internal format."""
+    reranked_dict = {}
+    for rank, candidate in enumerate(result.candidates):
+        # Higher score for higher rank (inverse of position)
+        reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
+    return reranked_dict
+
+
+# ========================================
+# Filter and Ranking Stages
+# ========================================
 
 
 class FilterStage:
@@ -143,13 +180,15 @@ class FilterStage:
         self.prompts = prompts
         self.filter_method = args.filter_method
         self.filter_topk = args.filter_topk
-
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_length = None
         self.tokenizer = None
         self.model = None
         self.pipe = None
         self.bert_tokenizer = None
         self.bert_model = None
+        self.rankllm_reranker = None
 
         self.filter_time = 0
         self.filter_count = 0
@@ -164,14 +203,14 @@ class FilterStage:
             self._init_bert_model()
         elif self.filter_method == "pointwise":
             if RANK_LLM_AVAILABLE:
-                print("Pointwise initialization would go here")
+                self._init_rankllm_pointwise()
             else:
                 print("Warning: Pointwise requires rank_llm library")
 
     def _init_custom_llm(self):
         """Initialize custom LLM model for filtering."""
-        print(f"Loading custom LLM for filter stage: {self.args.model_name}")
-        model_path, max_length, quantization_config = create_model_config(self.args.model_name)
+        print(f"Loading custom LLM for filter stage: {self.args.custom_model}")
+        model_path, max_length, quantization_config = create_model_config(self.args.custom_model)
 
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -192,9 +231,33 @@ class FilterStage:
     def _init_bert_model(self):
         """Initialize BERT model for filtering."""
         print(f"Loading BERT model: {self.args.bert_model}")
-        self.bert_tokenizer = AutoTokenizer.from_pretrained(self.args.bert_model)
-        self.bert_model = AutoModel.from_pretrained(self.args.bert_model).to('cuda')
+        model_path = os.path.join("models", self.args.bert_model)
+        self.bert_tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.bert_model = AutoModel.from_pretrained(model_path).to(self.device)
         print("BERT model loaded successfully")
+
+    def _init_rankllm_pointwise(self):
+        """Initialize RankLLM pointwise reranker."""
+        if not RANK_LLM_AVAILABLE:
+            print("Warning: rank_llm not available, cannot initialize pointwise reranker")
+            return
+        
+        print("Loading RankLLM pointwise reranker")
+        try:
+            # PointwiseRankLLM for pointwise ranking
+            # Local model directory
+            llm_root = os.environ.get("LLM_MODELS_ROOT")
+            self.rankllm_reranker = MonoT5(
+                model_path=os.path.join(llm_root, "monot5-base-msmarco-10k") if llm_root else "models/monot5-base-msmarco-10k",
+                context_size=CONTEXT_SIZE,
+                num_gpus=NUM_GPUS,
+                device=self.device,
+            )
+            print("RankLLM pointwise reranker loaded successfully")
+        except Exception as e:
+            print(f"Error initializing RankLLM pointwise reranker: {e}")
+            print("Falling back to custom LLM")
+            self.rankllm_reranker = None
 
     def filter(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Run the filter stage and return a relevance score dict."""
@@ -205,7 +268,7 @@ class FilterStage:
         elif self.filter_method == "bert_index":
             result = self._filter_bert(query, passages)
         elif self.filter_method == "pointwise":
-            result = self._filter_pointwise(query, passages)
+            result = self._filter_pointwise(query, passages, qid)
         else:
             raise ValueError(f"Unknown filter method: {self.filter_method}")
 
@@ -276,10 +339,30 @@ class FilterStage:
 
         return similarities
 
-    def _filter_pointwise(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
+    def _filter_pointwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Filter using Pointwise from rank_llm."""
-        print("Pointwise filtering not yet implemented, falling back to BERT")
-        return self._filter_bert(query, passages)
+        if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
+            print("Pointwise filtering not available, falling back to BERT")
+            return self._filter_bert(query, passages)
+
+        try:
+            # Convert to RankLLM format
+            request = _convert_to_rankllm_request(query, passages, qid)
+            
+            # Rerank using RankLLM
+            result = self.rankllm_reranker.rerank(
+                request=request,
+                rank_start=0,
+                rank_end=len(passages)
+            )
+            
+            # Convert back to our format
+            return _convert_from_rankllm_result(result)
+        
+        except Exception as e:
+            print(f"Error in RankLLM pointwise filtering: {e}")
+            print("Falling back to BERT filtering")
+            return self._filter_bert(query, passages)
 
     def export_shared_llm(self) -> Optional[Dict[str, object]]:
         """Expose custom LLM components for reuse by ranking stage."""
@@ -300,6 +383,7 @@ class RankingStage:
         self.args = args
         self.prompts = prompts
         self.ranking_method = args.ranking_method
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.max_length = None
         self.tokenizer = None
@@ -325,15 +409,27 @@ class RankingStage:
                 self.max_length = shared_custom_llm.get("max_length")
             else:
                 self._init_custom_llm()
-        elif self.ranking_method == "rankllm_listwise":
-            self._init_rankllm_listwise()
-        elif self.ranking_method == "rankllm_pointwise":
-            self._init_rankllm_pointwise()
+        elif self.ranking_method == "listwise":
+            if self.args.listwise_model == "custom_llm":
+                if shared_custom_llm and shared_custom_llm.get("pipe"):
+                    print("Reusing custom LLM from filter stage for RankLLM listwise reranker")
+                    model = shared_custom_llm.get("model")
+                else:
+                    model_path, max_length, quantization_config = create_model_config(self.args.custom_model)
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        device_map="auto",
+                        quantization_config=quantization_config,
+                        max_length=max_length,
+                    )
+            else:
+                model = None
+            self._init_rankllm_listwise(model=model)
 
     def _init_custom_llm(self):
         """Initialize custom LLM model for ranking."""
-        print(f"Loading custom LLM for ranking stage: {self.args.model_name}")
-        model_path, max_length, quantization_config = create_model_config(self.args.model_name)
+        print(f"Loading custom LLM for ranking stage: {self.args.custom_model}")
+        model_path, max_length, quantization_config = create_model_config(self.args.custom_model)
 
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -351,90 +447,55 @@ class RankingStage:
         )
         print("Custom LLM (ranking) loaded successfully")
     
-    def _init_rankllm_listwise(self):
+    def _init_rankllm_listwise(self, model: Optional[str] = None):
         """Initialize RankLLM listwise reranker."""
         if not RANK_LLM_AVAILABLE:
             print("Warning: rank_llm not available, cannot initialize listwise reranker")
             return
         
-        print(f"Loading RankLLM listwise reranker: {self.args.rankllm_model}")
+        print(f"Loading RankLLM listwise reranker: {self.args.listwise_model}")
         try:
-            # Use ZephyrReranker by default, which is a popular choice
-            # Users can modify this to use VicunaReranker or other models
-            if "zephyr" in self.args.rankllm_model.lower():
+            if self.args.listwise_window_size == "full":
+                print("Using RankLLM full window size for single-pass reranking")
+                window_size = self.args.filter_topk
+            else:
+                window_size = int(self.args.listwise_window_size)
+            
+            # Local model directory
+            llm_root = os.environ.get("LLM_MODELS_ROOT")
+            if "zephyr" in self.args.listwise_model.lower():
                 self.rankllm_reranker = ZephyrReranker(
-                    model_path=self.args.rankllm_model,
-                    context_size=4096,
-                    num_gpus=1,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    window_size=20,
-                    stride=10,
+                    model_path=os.path.join(llm_root, "rank_zephyr_7b_v1_full") if llm_root else "models/rank_zephyr_7b_v1_full",
+                    context_size=CONTEXT_SIZE,
+                    num_gpus=NUM_GPUS,
+                    device=self.device,
+                    window_size=window_size,
+                    stride=self.args.listwise_stride,
                 )
-            elif "vicuna" in self.args.rankllm_model.lower():
+            elif "vicuna" in self.args.listwise_model.lower():
                 self.rankllm_reranker = VicunaReranker(
-                    model_path=self.args.rankllm_model,
-                    context_size=4096,
-                    num_gpus=1,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    window_size=20,
-                    stride=10,
+                    model_path=os.path.join(llm_root, "rank_vicuna_7b_v1") if llm_root else "models/rank_vicuna_7b_v1",
+                    context_size=CONTEXT_SIZE,
+                    num_gpus=NUM_GPUS,
+                    device=self.device,
+                    window_size=window_size,
+                    stride=self.args.listwise_stride,
                 )
             else:
-                # Generic listwise reranker
+                # Use custom tranformers model with RankListwiseOSLLM
                 self.rankllm_reranker = RankListwiseOSLLM(
-                    model=self.args.rankllm_model,
-                    context_size=4096,
-                    num_gpus=1,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    window_size=20,
-                    stride=10,
+                    model=model,
+                    context_size=CONTEXT_SIZE,
+                    num_gpus=NUM_GPUS,
+                    device=self.device,
+                    window_size=window_size,
+                    stride=self.args.listwise_stride,
                 )
             print("RankLLM listwise reranker loaded successfully")
         except Exception as e:
             print(f"Error initializing RankLLM listwise reranker: {e}")
             print("Falling back to custom LLM")
             self.rankllm_reranker = None
-    
-    def _init_rankllm_pointwise(self):
-        """Initialize RankLLM pointwise reranker."""
-        if not RANK_LLM_AVAILABLE:
-            print("Warning: rank_llm not available, cannot initialize pointwise reranker")
-            return
-        
-        print(f"Loading RankLLM pointwise reranker: {self.args.rankllm_model}")
-        try:
-            # PointwiseRankLLM for pointwise ranking
-            self.rankllm_reranker = PointwiseRankLLM(
-                model=self.args.rankllm_model,
-                context_size=4096,
-                num_gpus=1,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-            )
-            print("RankLLM pointwise reranker loaded successfully")
-        except Exception as e:
-            print(f"Error initializing RankLLM pointwise reranker: {e}")
-            print("Falling back to custom LLM")
-            self.rankllm_reranker = None
-
-    def _convert_to_rankllm_request(self, query: str, passages: Dict[str, str], qid: str) -> 'Request':
-        """Convert internal format to RankLLM Request format."""
-        query_obj = Query(text=query, qid=qid)
-        candidates = []
-        for doc_id, text in passages.items():
-            candidates.append(Candidate(
-                docid=doc_id,
-                score=0.0,
-                doc={"text": text, "title": ""}
-            ))
-        return Request(query=query_obj, candidates=candidates)
-    
-    def _convert_from_rankllm_result(self, result: 'Result') -> Dict[str, float]:
-        """Convert RankLLM Result back to internal format."""
-        reranked_dict = {}
-        for rank, candidate in enumerate(result.candidates):
-            # Higher score for higher rank (inverse of position)
-            reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
-        return reranked_dict
 
     def rank(self, query: str, filtered_passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Run the ranking stage and return rank scores."""
@@ -442,10 +503,8 @@ class RankingStage:
 
         if self.ranking_method == "custom_llm":
             result = self._rank_custom_llm(query, filtered_passages)
-        elif self.ranking_method == "rankllm_listwise":
+        elif self.ranking_method == "listwise":
             result = self._rank_rankllm_listwise(query, filtered_passages, qid)
-        elif self.ranking_method == "rankllm_pointwise":
-            result = self._rank_rankllm_pointwise(query, filtered_passages, qid)
         else:
             raise ValueError(f"Unknown ranking method: {self.ranking_method}")
 
@@ -490,7 +549,7 @@ class RankingStage:
 
         try:
             # Convert to RankLLM format
-            request = self._convert_to_rankllm_request(query, passages, qid)
+            request = _convert_to_rankllm_request(query, passages, qid)
             
             # Rerank using RankLLM
             result = self.rankllm_reranker.rerank(
@@ -500,75 +559,16 @@ class RankingStage:
             )
             
             # Convert back to our format
-            return self._convert_from_rankllm_result(result)
+            return _convert_from_rankllm_result(result)
         except Exception as e:
             print(f"Error in RankLLM listwise ranking: {e}")
             print("Falling back to custom LLM")
             return self._rank_custom_llm(query, passages)
-
-    def _rank_rankllm_pointwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
-        """Rank using rank_llm pointwise ranker."""
-        if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
-            print("Warning: rank_llm not available, falling back to custom LLM")
-            return self._rank_custom_llm(query, passages)
-
-        try:
-            # Convert to RankLLM format
-            request = self._convert_to_rankllm_request(query, passages, qid)
-            
-            # Rerank using RankLLM
-            result = self.rankllm_reranker.rerank(
-                request=request,
-                rank_start=0,
-                rank_end=len(passages)
-            )
-            
-            # Convert back to our format
-            return self._convert_from_rankllm_result(result)
-        except Exception as e:
-            print(f"Error in RankLLM pointwise ranking: {e}")
-            print("Falling back to custom LLM")
-            return self._rank_custom_llm(query, passages)
-
-
-class TwoStageRanker:
-    """
-    Combined two-stage ranker for compatibility.
-    Combines FilterStage and RankingStage into a single interface.
-    """
-    def __init__(self, args, prompts: Dict[str, str]):
-        self.args = args
-        self.prompts = prompts
-        self.filter_stage = FilterStage(args, prompts)
-        self.ranking_stage = RankingStage(args, prompts, self.filter_stage.export_shared_llm())
-    
-    def two_stage_rerank(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
-        """
-        Run complete two-stage reranking.
         
-        Args:
-            query: Query text
-            passages: Dict of {doc_id: passage_text}
-            qid: Query ID
-            
-        Returns:
-            Dict of {doc_id: final_score}
-        """
-        # Stage 1: Filter
-        filter_scores = self.filter_stage.filter(query, passages, qid)
-        if not filter_scores:
-            return {}
-        
-        # Get top-k from filter stage
-        sorted_filtered = sorted(filter_scores.items(), key=lambda x: x[1], reverse=True)
-        top_k_passages = {pid: passages[pid] for pid, _ in sorted_filtered[:self.args.filter_topk] if pid in passages}
-        
-        if not top_k_passages:
-            return {}
-        
-        # Stage 2: Rank
-        final_scores = self.ranking_stage.rank(query, top_k_passages, qid)
-        return final_scores
+
+# ========================================
+# Main Pipeline Functions
+# ========================================
 
 
 def load_bm25_results(dataset: str, bm25_topk: int) -> Tuple[Dict, Dict]:
@@ -631,18 +631,17 @@ def evaluate_metrics(qrels: Dict, run: Dict) -> Dict:
         return {}
 
 
-def save_results(args, metrics_dict: Dict, codecarbon_metrics: Dict, output_dir: str):
+def save_results(args, metrics_dict: Dict, codecarbon_metrics: Dict, output_dir: str, filter_method_name: str, ranking_method_name: str) -> str:
     """Save all metrics to JSON file with descriptive filename."""
     os.makedirs(output_dir, exist_ok=True)
     
     # Create filename with hyperparameters
     filename = (
+        f"results_"
         f"{args.dataset}_"
-        f"{args.model_name}_"
-        f"filter-{args.filter_method}_"
-        f"rank-{args.ranking_method}_"
-        f"topk{args.filter_topk}_"
-        f"results.json"
+        f"filter{args.filter_topk}-{filter_method_name}_"
+        f"rank-{ranking_method_name}_"
+        f"top{args.bm25_topk}.json"
     )
     
     filepath = os.path.join(output_dir, filename)
@@ -651,13 +650,11 @@ def save_results(args, metrics_dict: Dict, codecarbon_metrics: Dict, output_dir:
     full_results = {
         'config': {
             'dataset': args.dataset,
-            'model_name': args.model_name,
-            'filter_method': args.filter_method,
-            'ranking_method': args.ranking_method,
+            'filter_method': filter_method_name,
+            'ranking_method': ranking_method_name,
+            'stage': args.stage,
             'bm25_topk': args.bm25_topk,
             'filter_topk': args.filter_topk,
-            'rankllm_model': args.rankllm_model if hasattr(args, 'rankllm_model') else None,
-            'bert_model': args.bert_model if hasattr(args, 'bert_model') else None,
         },
         'metrics': metrics_dict,
         'codecarbon': codecarbon_metrics,
@@ -671,12 +668,17 @@ def save_results(args, metrics_dict: Dict, codecarbon_metrics: Dict, output_dir:
     return filepath
 
 
-def save_filtered_rundict(filtered_rundict: Dict, output_path: str):
-    """Persist filtered rundict to disk for later reranking."""
+def save_rundict(rundict: Dict, output_path: str):
+    """Persist rundict to disk for later reranking."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(filtered_rundict, f, indent=2)
-    print(f"Filtered rundict saved to: {output_path}")
+        json.dump(rundict, f, indent=2)
+    print(f"Rundict saved to: {output_path}")
+
+
+# ========================================
+# Main Execution
+# ========================================
 
 
 def main():
@@ -734,13 +736,27 @@ def main():
     emissions_dir = os.path.join(args.output_dir, 'emissions')
     os.makedirs(emissions_dir, exist_ok=True)
 
+    if args.stage == "rerank" and not args.load_filtered_rundict:
+        filter_method_name = "Direct"
+    elif args.filter_method == "custom_llm":
+        filter_method_name = f"CustomLLM-{args.custom_model}"
+    elif args.filter_method == "pointwise":
+        filter_method_name = "Pointwise"
+    elif args.filter_method == "bert_index":
+        filter_method_name = f"BERT-{args.bert_model}"
+
+    if args.stage == "filter":
+        ranking_method_name = "N/A"
+    elif args.ranking_method == "custom_llm":
+        ranking_method_name = f"CustomLLM-{args.custom_model}"
+    elif args.ranking_method == "listwise":
+        ranking_method_name = f"Listwise-{args.listwise_model}-W{args.listwise_window_size}-S{args.listwise_stride}"
+
     filter_emissions_file = (
-        f"emissions_filter_{args.dataset}_{args.filter_method}_"
-        f"topk{args.filter_topk}.csv"
+        f"emissions_filter_{args.dataset}_{filter_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.csv"
     )
     ranking_emissions_file = (
-        f"emissions_ranking_{args.dataset}_{args.ranking_method}_"
-        f"topk{args.filter_topk}.csv"
+        f"emissions_ranking_{args.dataset}_{ranking_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.csv"
     )
 
     tracker_filter = None
@@ -752,9 +768,16 @@ def main():
     queries_to_process = [qid for qid in qrels.keys() if qid in queries]
     print(f"Processing {len(queries_to_process)} queries")
 
-    filtered_output_path = args.filtered_output or os.path.join(
+    filtered_output_path = os.path.join(
         args.output_dir,
-        f"filtered_{args.dataset}_{args.filter_method}_topk{args.filter_topk}.json"
+        "rundicts",
+        f"filtered_{args.dataset}_{filter_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.json"
+    )
+
+    ranking_output_path = os.path.join(
+        args.output_dir,
+        "rundicts",
+        f"ranked_{args.dataset}_{ranking_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.json"
     )
 
     if args.stage in ("filter", "both"):
@@ -798,91 +821,82 @@ def main():
                 if not filter_scores:
                     continue
                 sorted_passages = sorted(filter_scores.items(), key=lambda x: x[1], reverse=True)
-                filtered_rundict[str(qid)] = {pid: score for pid, score in sorted_passages[:args.filter_topk]}
+                filtered_rundict[str(qid)] = {pid: score for pid, score in sorted_passages}
             except Exception as e:
                 print(f"Error filtering query {qid}: {e}")
                 continue
 
         tracker_filter.stop()
-        save_filtered_rundict(filtered_rundict, filtered_output_path)
+        save_rundict(filtered_rundict, filtered_output_path)
 
-        if args.stage == "filter":
-            codecarbon_metrics = {}
-            filter_csv_path = os.path.join(emissions_dir, filter_emissions_file)
-            if os.path.exists(filter_csv_path):
-                with open(filter_csv_path, 'r') as f:
-                    reader = csv.DictReader(f)
-                    reader_list = list(reader)
-                    filter_data = reader_list[-1] if reader_list else {}
-                    codecarbon_metrics['filter'] = {
-                        'emissions_kg': float(filter_data.get('emissions', 0)),
-                        'energy_consumed_kwh': float(filter_data.get('energy_consumed', 0)),
-                        'duration_s': float(filter_data.get('duration', 0)),
-                    }
-            codecarbon_metrics['timing'] = {
-                'filter_avg_time_s': filter_engine.filter_time / max(filter_engine.filter_count, 1),
-                'filter_total_time_s': filter_engine.filter_time,
-            }
-
-            print("\nFilter stage complete. Reranking skipped (stage=filter).")
-            print(json.dumps(codecarbon_metrics, indent=2))
-            return
+        # No early return here; filter-only runs will skip ranking later but still report metrics
 
     if args.stage == "rerank":
-        if not args.filtered_rundict:
-            print("Error: --filtered_rundict is required for rerank-only stage")
+        if not args.load_filtered_rundict:
+            print(f"Using top{args.bm25_topk} BM25 results as filtered rundict for reranking")
+            for qid in queries_to_process:
+                bm25_qid = str(qid) if str(qid) in bm25_rundict else qid
+                top_k_passage_ids = list(bm25_rundict[bm25_qid].keys())[:args.bm25_topk]
+                filtered_rundict = {bm25_qid: {pid: bm25_rundict[bm25_qid][pid] for pid in top_k_passage_ids}}
+        elif not os.path.exists(filtered_output_path):
+            print(f"Error: Provided filtered rundict not found at {filtered_output_path}")
             return
-        if not os.path.exists(args.filtered_rundict):
-            print(f"Error: Provided filtered rundict not found at {args.filtered_rundict}")
-            return
-        with open(args.filtered_rundict, 'r', encoding='utf-8') as f:
-            filtered_rundict = json.load(f)
-
-    if not filtered_rundict:
-        print("Error: No filtered rundict available for ranking stage")
-        return
-
-    print("\nRunning ranking stage...")
-    ranking_engine = RankingStage(args, prompts, shared_custom_llm=filter_engine.export_shared_llm() if filter_engine else None)
-    tracker_ranking = OfflineEmissionsTracker(
-        country_iso_code="FRA",
-        tracking_mode="process",
-        on_csv_write="append",
-        project_name="RankLLM-Ranking",
-        log_level="warning",
-        output_dir=emissions_dir,
-        output_file=ranking_emissions_file
-    )
-    tracker_ranking.start()
+        else:
+            with open(filtered_output_path, 'r', encoding='utf-8') as f:
+                filtered_rundict = json.load(f)
 
     rundict_rerank = {}
-    for qid in tqdm(queries_to_process, desc="Reranking queries"):
-        query_text = queries[qid]
-        filtered_scores = filtered_rundict.get(str(qid)) or filtered_rundict.get(qid)
-        if not filtered_scores:
-            print(f"Warning: No filtered docs for query {qid}")
-            continue
 
-        sorted_filtered = sorted(filtered_scores.items(), key=lambda x: x[1], reverse=True)
-        filtered_passages = {}
-        for pid, _ in sorted_filtered:
-            if pid in corpus:
-                filtered_passages[pid] = corpus[pid]
-            elif str(pid) in corpus:
-                filtered_passages[str(pid)] = corpus[str(pid)]
+    if args.stage in ("both", "rerank"):
+        if not filtered_rundict:
+            print("Error: No filtered rundict available for ranking stage")
+            return
 
-        if not filtered_passages:
-            print(f"Warning: No passages found for reranking query {qid}")
-            continue
+        print("\nRunning ranking stage...")
+        ranking_engine = RankingStage(args, prompts, shared_custom_llm=filter_engine.export_shared_llm() if filter_engine else None)
+        tracker_ranking = OfflineEmissionsTracker(
+            country_iso_code="FRA",
+            tracking_mode="process",
+            on_csv_write="append",
+            project_name="RankLLM-Ranking",
+            log_level="warning",
+            output_dir=emissions_dir,
+            output_file=ranking_emissions_file
+        )
+        tracker_ranking.start()
 
-        try:
-            final_scores = ranking_engine.rank(query_text, filtered_passages, str(qid))
-            rundict_rerank[str(qid)] = final_scores
-        except Exception as e:
-            print(f"Error reranking query {qid}: {e}")
-            continue
+        for qid in tqdm(queries_to_process, desc="Reranking queries"):
+            query_text = queries[qid]
+            filtered_scores = filtered_rundict.get(str(qid)) or filtered_rundict.get(qid)
+            filtered_scores = {pid: score for pid, score in list(filtered_scores.items())[:args.filter_topk]}
+            if not filtered_scores:
+                print(f"Warning: No filtered docs for query {qid}")
+                continue
 
-    tracker_ranking.stop()
+            sorted_filtered = sorted(filtered_scores.items(), key=lambda x: x[1], reverse=True)
+            filtered_passages = {}
+            for pid, _ in sorted_filtered:
+                if pid in corpus:
+                    filtered_passages[pid] = corpus[pid]
+                elif str(pid) in corpus:
+                    filtered_passages[str(pid)] = corpus[str(pid)]
+
+            if not filtered_passages:
+                print(f"Warning: No passages found for reranking query {qid}")
+                continue
+
+            try:
+                final_scores = ranking_engine.rank(query_text, filtered_passages, str(qid))
+                rundict_rerank[str(qid)] = final_scores
+            except Exception as e:
+                print(f"Error reranking query {qid}: {e}")
+                continue
+
+        tracker_ranking.stop()
+        save_rundict(rundict_rerank, ranking_output_path)
+    else:
+        ranking_engine = None
+        tracker_ranking = None
 
     print("\nEvaluating results...")
 
@@ -890,37 +904,44 @@ def main():
     if bm25_metrics:
         print("BM25 baseline metrics:")
         print(json.dumps(bm25_metrics, indent=2))
+    filtered_metrics = evaluate_metrics(qrels, filtered_rundict) if filtered_rundict else {}
+    if filtered_metrics:
+        print("\nFiltered results metrics:")
+        print(json.dumps(filtered_metrics, indent=2))
 
-    rerank_metrics = evaluate_metrics(qrels, rundict_rerank)
-    print("\nTwo-stage reranking metrics:")
-    print(json.dumps(rerank_metrics, indent=2))
+    if args.stage in ("both", "rerank"):
+        rerank_metrics = evaluate_metrics(qrels, rundict_rerank)
+        print("\nTwo-stage reranking metrics:")
+        print(json.dumps(rerank_metrics, indent=2))
+    else:
+        rerank_metrics = {}
 
     codecarbon_metrics = {}
 
-    if tracker_filter:
-        filter_csv_path = os.path.join(emissions_dir, filter_emissions_file)
-        if os.path.exists(filter_csv_path):
-            with open(filter_csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                reader_list = list(reader)
-                filter_data = reader_list[-1] if reader_list else {}
-                codecarbon_metrics['filter'] = {
-                    'emissions_kg': float(filter_data.get('emissions', 0)),
-                    'energy_consumed_kwh': float(filter_data.get('energy_consumed', 0)),
-                    'duration_s': float(filter_data.get('duration', 0)),
-                }
-
-    ranking_csv_path = os.path.join(emissions_dir, ranking_emissions_file)
-    if os.path.exists(ranking_csv_path):
-        with open(ranking_csv_path, 'r') as f:
+    filter_csv_path = os.path.join(emissions_dir, filter_emissions_file)
+    if os.path.exists(filter_csv_path):
+        with open(filter_csv_path, 'r') as f:
             reader = csv.DictReader(f)
             reader_list = list(reader)
-            ranking_data = reader_list[-1] if reader_list else {}
-            codecarbon_metrics['ranking'] = {
-                'emissions_kg': float(ranking_data.get('emissions', 0)),
-                'energy_consumed_kwh': float(ranking_data.get('energy_consumed', 0)),
-                'duration_s': float(ranking_data.get('duration', 0)),
+            filter_data = reader_list[-1] if reader_list else {}
+            codecarbon_metrics['filter'] = {
+                'emissions_kg': float(filter_data.get('emissions', 0)),
+                'energy_consumed_kwh': float(filter_data.get('energy_consumed', 0)),
+                'duration_s': float(filter_data.get('duration', 0)),
             }
+
+    if tracker_ranking:
+        ranking_csv_path = os.path.join(emissions_dir, ranking_emissions_file)
+        if os.path.exists(ranking_csv_path):
+            with open(ranking_csv_path, 'r') as f:
+                reader = csv.DictReader(f)
+                reader_list = list(reader)
+                ranking_data = reader_list[-1] if reader_list else {}
+                codecarbon_metrics['ranking'] = {
+                    'emissions_kg': float(ranking_data.get('emissions', 0)),
+                    'energy_consumed_kwh': float(ranking_data.get('energy_consumed', 0)),
+                    'duration_s': float(ranking_data.get('duration', 0)),
+                }
 
     timing_metrics = {}
     if filter_engine:
@@ -930,8 +951,12 @@ def main():
         timing_metrics['filter_avg_time_s'] = 0
         timing_metrics['filter_total_time_s'] = 0
 
-    timing_metrics['ranking_avg_time_s'] = ranking_engine.ranking_time / max(ranking_engine.ranking_count, 1)
-    timing_metrics['ranking_total_time_s'] = ranking_engine.ranking_time
+    if ranking_engine:
+        timing_metrics['ranking_avg_time_s'] = ranking_engine.ranking_time / max(ranking_engine.ranking_count, 1)
+        timing_metrics['ranking_total_time_s'] = ranking_engine.ranking_time
+    else:
+        timing_metrics['ranking_avg_time_s'] = 0
+        timing_metrics['ranking_total_time_s'] = 0
     codecarbon_metrics['timing'] = timing_metrics
 
     print("\nCodeCarbon metrics:")
@@ -939,17 +964,18 @@ def main():
 
     all_metrics = {
         'bm25': bm25_metrics,
+        'filtered': filtered_metrics,
         'two_stage_reranking': rerank_metrics,
     }
 
-    results_file = save_results(args, all_metrics, codecarbon_metrics, args.output_dir)
+    results_file = save_results(args, all_metrics, codecarbon_metrics, args.output_dir, filter_method_name, ranking_method_name)
 
     print("\n" + "="*20)
     print("EVALUATION COMPLETE")
     print("="*20)
     print(f"Dataset: {args.dataset}")
-    print(f"Filter method: {args.filter_method}")
-    print(f"Ranking method: {args.ranking_method}")
+    print(f"Filter method: {filter_method_name}")
+    print(f"Ranking method: {ranking_method_name}")
     print(f"Results saved to: {results_file}")
     print("="*20)
 
