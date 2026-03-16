@@ -112,6 +112,12 @@ def get_args():
     parser.add_argument("--output_dir", type=str, default="rankllm_results",
                        help="Directory to save results")
     
+    # BM25 index configuration
+    parser.add_argument("--bm25_index_path", type=str, default=None,
+                       help="Path to a local pyserini Lucene index. "
+                            "If not provided, tries pyserini prebuilt BEIR index "
+                            "(beir-v1.0.0-{dataset}.flat).")
+    
     return parser.parse_args()
 
 
@@ -571,10 +577,25 @@ class RankingStage:
 # ========================================
 
 
-def load_bm25_results(dataset: str, bm25_topk: int) -> Tuple[Dict, Dict]:
+def load_bm25_results(dataset: str, bm25_topk: int,
+                      queries: Optional[Dict] = None,
+                      corpus: Optional[Dict] = None,
+                      index_path: Optional[str] = None) -> Tuple[Dict, Dict]:
     """
     Load or compute BM25 results using pyserini.
-    
+
+    If pre-cached JSON files exist they are returned immediately.
+    Otherwise, pyserini is used to search the index (either the path given by
+    *index_path* or the pyserini prebuilt BEIR index for *dataset*).
+
+    Args:
+        dataset: dataset name (e.g. "scifact", "fiqa")
+        bm25_topk: number of documents to retrieve per query
+        queries: {qid: query_text} mapping (needed when cache is missing)
+        corpus: {doc_id: text} mapping (needed to populate passage texts)
+        index_path: path to a local pyserini Lucene index; if None, the
+                    prebuilt BEIR index ``beir-v1.0.0-{dataset}.flat`` is used.
+
     Returns:
         bm25_rundict: Dict of qid -> {doc_id: score}
         queries_with_passages: Dict of qid -> {query: str, passages: {doc_id: text}}
@@ -590,27 +611,65 @@ def load_bm25_results(dataset: str, bm25_topk: int) -> Tuple[Dict, Dict]:
             queries_with_passages = json.load(f)
         return bm25_rundict, queries_with_passages
     
-    print(f"Computing BM25 results for {dataset}...")
-    
-    # Try to load dataset with BEIR
-    try:
-        corpus, queries, qrels = GenericDataLoader(f"datasets/{dataset}").load(split="test")
-        corpus = {k: v['text'] if isinstance(v, dict) else v for k, v in corpus.items()}
-    except Exception as e:
-        print(f"Error loading dataset {dataset}: {e}")
+    print(f"Computing BM25 results for {dataset} using pyserini...")
+
+    if not queries:
+        print("Error: queries must be provided to compute BM25 results.")
         return {}, {}
-    
-    # For now, return empty results as pyserini index might not be available
-    # In practice, would use LuceneSearcher or create BM25 index
-    print("Warning: BM25 index not available, returning empty results")
-    print("To use this script, ensure pyserini indexes are available or pre-compute BM25 results")
-    
+
+    try:
+        if index_path:
+            print(f"Opening local pyserini index: {index_path}")
+            searcher = LuceneSearcher(index_path)
+        else:
+            prebuilt_name = f'beir-v1.0.0-{dataset}.flat'
+            print(f"Loading pyserini prebuilt index: {prebuilt_name}")
+            searcher = LuceneSearcher.from_prebuilt_index(prebuilt_name)
+    except Exception as e:
+        print(f"Error opening pyserini index: {e}")
+        print("Provide --bm25_index_path or ensure the dataset has a prebuilt pyserini index.")
+        return {}, {}
+
     bm25_rundict = {}
     queries_with_passages = {}
-    
-    # Create directory if it doesn't exist
+
+    for qid, query_text in tqdm(queries.items(), desc="BM25 search"):
+        try:
+            hits = searcher.search(query_text, k=bm25_topk)
+        except Exception as e:
+            print(f"Error searching query {qid}: {e}")
+            continue
+
+        doc_scores = {}
+        passages = {}
+        for hit in hits:
+            docid = str(hit.docid)
+            doc_scores[docid] = float(hit.score)
+
+            # Retrieve text: prefer local corpus, fall back to index raw content
+            if corpus and docid in corpus:
+                text = corpus[docid]
+            elif corpus and docid.lstrip('d') in corpus:
+                text = corpus[docid.lstrip('d')]
+            else:
+                try:
+                    raw = json.loads(searcher.doc(hit.docid).raw())
+                    text = raw.get('contents', raw.get('text', ''))
+                except Exception:
+                    text = ''
+            passages[docid] = text
+
+        bm25_rundict[str(qid)] = doc_scores
+        queries_with_passages[str(qid)] = {'query': query_text, 'passages': passages}
+
+    # Persist to cache
     os.makedirs('rundicts', exist_ok=True)
-    
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump(bm25_rundict, f, indent=2)
+    with open(queries_file, 'w', encoding='utf-8') as f:
+        json.dump(queries_with_passages, f, indent=2)
+    print(f"BM25 results saved to {cache_file}")
+
     return bm25_rundict, queries_with_passages
 
 
@@ -720,12 +779,25 @@ def main():
         corpus = {k: v['text'] if isinstance(v, dict) else v for k, v in corpus.items()}
         print(f"Loaded {len(corpus)} documents, {len(queries)} queries, {len(qrels)} qrels")
     except Exception as e:
-        print(f"Error loading dataset: {e}")
-        print("Please ensure the dataset is available in datasets/ directory")
-        return
+        print(f"Dataset not found locally ({e}). Trying BEIR auto-download...")
+        try:
+            from beir import util as beir_util
+            url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{args.dataset}.zip"
+            beir_util.download_and_unzip(url, "datasets")
+            corpus, queries, qrels = GenericDataLoader(f"datasets/{args.dataset}").load(split="test")
+            corpus = {k: v['text'] if isinstance(v, dict) else v for k, v in corpus.items()}
+            print(f"Downloaded and loaded {len(corpus)} documents, {len(queries)} queries, {len(qrels)} qrels")
+        except Exception as e2:
+            print(f"Error loading dataset: {e2}")
+            print("Please ensure the dataset is available in datasets/ directory or can be downloaded from BEIR.")
+            return
     
     # Load BM25 results (needed for filtering stage)
-    bm25_rundict, queries_with_passages = load_bm25_results(args.dataset, args.bm25_topk)
+    bm25_rundict, queries_with_passages = load_bm25_results(
+        args.dataset, args.bm25_topk,
+        queries=queries, corpus=corpus,
+        index_path=args.bm25_index_path
+    )
 
     if args.stage in ("filter", "both") and not bm25_rundict:
         print("\nError: BM25 results not available.")
