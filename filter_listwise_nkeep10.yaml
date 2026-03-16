@@ -1,0 +1,11 @@
+method: "singleturn_listwise"
+system_message: "You are FilterLLM, an intelligent assistant that filters passages based on their relevancy to the query to an exact amount of 10."
+prefix: |
+  I will provide you with {num} passages, each indicated by a numerical identifier []. Filter those passages to exactly 10 based on their relevance to the search query: {query}.
+body: |
+  [{rank}] {candidate}
+suffix: |-
+  Search Query: {query}.
+  Filter the {num} passages above to exactly 10 based on their relevance to the search query. Exactly 10 passages should be included and listed using identifiers, in descending order of relevance. The output format should be [] > [], e.g., [2] > [1], Answer concisely and directly and only respond with the 10 filtered results, do not say any word or explain.
+output_validation_regex: r"^\[\d+\]( > \[\d+\])*$"
+output_extraction_regex: r"\[(\d+)\]" 
