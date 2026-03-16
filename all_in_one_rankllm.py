@@ -14,10 +14,12 @@ This script implements:
 """
 
 import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import json
 import time
 import argparse
-from typing import Dict, List, Optional, Tuple
+import inspect
+from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig, AutoModel
@@ -26,23 +28,25 @@ from beir.datasets.data_loader import GenericDataLoader
 from pyserini.search.lucene import LuceneSearcher
 from ranx import Qrels, Run, evaluate
 import csv
+from utils import create_model_config, load_dataset, _convert_to_rankllm_request, _convert_from_rankllm_result, cleanup_stage_engine, fit_filter_passages_to_context, fit_ranking_passages_to_context, _truncate_passages_for_rankllm
 
 # Try to import rank_llm components - will handle gracefully if not installed
 RANK_LLM_AVAILABLE = False
+CONTEXT_SIZE = 16384
+NUM_GPUS = 4
 try:
-    from rank_llm.data import Request, Query, Candidate, Result
+    from rank_llm.rerank import Reranker
     from rank_llm.rerank.listwise import (
-        SafeOpenai,
         VicunaReranker,
         ZephyrReranker,
-        RankListwiseOSLLM,
     )
     from rank_llm.rerank.pointwise.monot5 import MonoT5
-    from rank_llm.rerank.pointwise import PointwiseRankLLM
-    from rank_llm.rerank.rankllm import PromptMode
     RANK_LLM_AVAILABLE = True
-    CONTEXT_SIZE = 32768
-    NUM_GPUS = 2
+    try:
+        from rank_llm.rerank.listwise import RankListwiseOSLLM
+    except ImportError:
+        print("Warning: RankListwiseOSLLM not available, will not support custom LLM listwise reranking")
+
 
 except ImportError:
     print("Warning: rank_llm not fully installed. Will use fallback implementations.")
@@ -69,6 +73,15 @@ except ImportError:
             self.candidates = candidates
 
 
+# Monkey patch to add top-k filtering to RankListwiseOSLLM
+try:
+    from monkeypatch import FilterListwiseOSLLM, apply_run_llm_monkeypatch, apply_run_llm_batched_monkeypatch
+    apply_run_llm_monkeypatch()
+    apply_run_llm_batched_monkeypatch()
+except Exception as e:
+    print(f"Warning: Could not monkey patch ListwiseRankLLM: {e}")
+
+
 def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="RankLLM evaluation pipeline with two-stage strategy")
@@ -77,25 +90,24 @@ def get_args():
     parser.add_argument("--dataset", type=str, default="scifact", 
                        help="Dataset to test (scifact, trec-covid, fiqa, etc.)")
     parser.add_argument("--custom_model", type=str, default=None,
-                       choices=["qwen4", "qwen30", None],
                        help="Model to use for custom LLM ranking")
     parser.add_argument("--bm25_topk", type=int, default=100,
                        help="Top-k documents from BM25 to rerank")
     
     # Two-stage strategy configuration
     parser.add_argument("--filter_method", type=str, default="custom_llm",
-                       choices=["custom_llm", "pointwise", "bert_index"],
+                       choices=["custom_llm", "custom_llm_vllm", "pointwise", "bert_index", "RankLLM_custom"],
                        help="Method for filter stage")
     parser.add_argument("--filter_topk", type=int, default=10,
                        help="Number of passages to keep after filter stage")
     parser.add_argument("--ranking_method", type=str, default="custom_llm",
-                       choices=["custom_llm", "listwise"],
+                       choices=["custom_llm", "custom_llm_vllm", "listwise"],
                        help="Method for ranking stage")
     parser.add_argument("--stage", type=str, default="both", # If only rerank is selected and no filtered rundict is provided, will single-pass rerank BM25 results
                        choices=["filter", "rerank", "both"],
                        help="Select which stage(s) to run: filter only, rerank only, or both")
-    parser.add_argument("--load_filtered_rundict", action="store_true",
-                       help="Load precomputed filtered rundict with filter args instead of running filter stage")
+    parser.add_argument("--load_filtered_rundict", type=str, default=None,
+                       help="Path to precomputed filtered rundict JSON; if None, rerank directly from BM25")
     
     # RankLLM specific options
     parser.add_argument("--listwise_model", type=str, default="zephyr",
@@ -111,60 +123,10 @@ def get_args():
     # Output configuration
     parser.add_argument("--output_dir", type=str, default="rankllm_results",
                        help="Directory to save results")
+    parser.add_argument("--vllm_seed", type=int, default=0,
+                       help="Seed for deterministic vLLM generation")
     
     return parser.parse_args()
-
-
-def create_model_config(model_name: str) -> Tuple[str, int, Optional[BitsAndBytesConfig]]:
-    """Create model configuration based on model name."""
-
-    model_configs = {
-        'qwen4': ('Qwen3-4B-Instruct-2507', CONTEXT_SIZE, True),
-        'qwen30': ('Qwen3-30B-A3B-Instruct-2507', CONTEXT_SIZE, True),
-    }
-    
-    if model_name not in model_configs:
-        raise ValueError(f"Model {model_name} not supported")
-    
-    model_path, max_length, use_quant = model_configs[model_name]
-    # Local model directory
-    llm_root = os.environ.get("LLM_MODELS_ROOT")
-    if llm_root:
-        model_path = os.path.join(llm_root, model_path)
-    else:
-        model_path = os.path.join("models", model_path)
-    
-    quantization_config = None
-    if use_quant:
-        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-    
-    return model_path, max_length, quantization_config
-
-
-# ========================================
-# RankLLM utils
-# ========================================
-
-
-def _convert_to_rankllm_request(self, query: str, passages: Dict[str, str], qid: str) -> 'Request':
-    """Convert internal format to RankLLM Request format."""
-    query_obj = Query(text=query, qid=qid)
-    candidates = []
-    for doc_id, text in passages.items():
-        candidates.append(Candidate(
-            docid=doc_id,
-            score=0.0,
-            doc={"text": text, "title": ""}
-        ))
-    return Request(query=query_obj, candidates=candidates)
-
-def _convert_from_rankllm_result(self, result: 'Result') -> Dict[str, float]:
-    """Convert RankLLM Result back to internal format."""
-    reranked_dict = {}
-    for rank, candidate in enumerate(result.candidates):
-        # Higher score for higher rank (inverse of position)
-        reranked_dict[str(candidate.docid)] = len(result.candidates) - rank
-    return reranked_dict
 
 
 # ========================================
@@ -186,9 +148,13 @@ class FilterStage:
         self.tokenizer = None
         self.model = None
         self.pipe = None
+        self.vllm_llm = None
+        self.vllm_handler = None
+        self.vllm_generate_target = None
+        self.vllm_seed = int(getattr(args, "vllm_seed", 0))
         self.bert_tokenizer = None
         self.bert_model = None
-        self.rankllm_reranker = None
+        self.rankllm_filter = None
 
         self.filter_time = 0
         self.filter_count = 0
@@ -199,6 +165,8 @@ class FilterStage:
         """Initialize filter models based on configuration."""
         if self.filter_method == "custom_llm":
             self._init_custom_llm()
+        elif self.filter_method == "custom_llm_vllm":
+            self._init_custom_llm_vllm()
         elif self.filter_method == "bert_index":
             self._init_bert_model()
         elif self.filter_method == "pointwise":
@@ -206,11 +174,16 @@ class FilterStage:
                 self._init_rankllm_pointwise()
             else:
                 print("Warning: Pointwise requires rank_llm library")
+        elif self.filter_method == "RankLLM_custom":
+            if RANK_LLM_AVAILABLE:
+                self._init_rankllm_custom()
+            else:
+                print("Warning: RankLLM_custom filter method requires rank_llm library")
 
     def _init_custom_llm(self):
         """Initialize custom LLM model for filtering."""
         print(f"Loading custom LLM for filter stage: {self.args.custom_model}")
-        model_path, max_length, quantization_config = create_model_config(self.args.custom_model)
+        model_path, max_length, quantization_config = create_model_config(self.args.custom_model, CONTEXT_SIZE)
 
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -226,7 +199,262 @@ class FilterStage:
             model=self.model,
             tokenizer=self.tokenizer,
         )
+        self.vllm_llm = None
+        self.vllm_handler = None
+        self.vllm_generate_target = None
         print("Custom LLM (filter) loaded successfully")
+
+    def _init_custom_llm_vllm(self):
+        """Initialize custom LLM model for filtering using rank_llm vLLM handler."""
+        print(f"Loading custom LLM vLLM backend for filter stage: {self.args.custom_model}")
+        model_path, max_length, quantization_config = create_model_config(self.args.custom_model, CONTEXT_SIZE)
+        self.max_length = max_length
+
+        try:
+            from vllm import LLM
+            self.vllm_llm = LLM(
+                model=model_path,
+                tensor_parallel_size=NUM_GPUS,
+                gpu_memory_utilization=0.75,
+                trust_remote_code=True,
+                max_model_len=CONTEXT_SIZE,
+                seed=self.vllm_seed,
+                enforce_eager=False,
+                disable_log_stats=True,
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model = None
+            self.pipe = None
+            self.vllm_handler = None
+            self.vllm_generate_target = self.vllm_llm
+            print("Custom native vLLM backend (filter) loaded successfully")
+        except Exception as e:
+            print(f"Warning: direct vLLM init failed, trying RankLLM VllmHandler fallback: {e}")
+            self.vllm_llm = None
+
+            if not RANK_LLM_AVAILABLE:
+                print("Warning: rank_llm not available, falling back to HF custom_llm")
+                self._init_custom_llm()
+                return
+
+            try:
+                from rank_llm.rerank.vllm_handler import VllmHandler
+
+                self.vllm_handler = VllmHandler(
+                    model=model_path,
+                    download_dir=os.getenv("HF_HOME"),
+                    enforce_eager=False,
+                    max_logprobs=30,
+                    tensor_parallel_size=NUM_GPUS,
+                    gpu_memory_utilization=0.75,
+                    trust_remote_code=True,
+                    max_model_len=CONTEXT_SIZE,
+                    disable_log_stats=True,
+                )
+                self.tokenizer = self.vllm_handler.get_tokenizer()
+                self.model = None
+                self.pipe = None
+                self.vllm_generate_target = self._discover_vllm_generate_target(self.vllm_handler)
+                print("Custom RankLLM vLLM backend (filter) loaded successfully")
+                if self.vllm_generate_target is None:
+                    print("Warning: no direct generate target discovered on VllmHandler at init")
+            except Exception as e2:
+                print(f"Error initializing custom LLM vLLM backend: {e2}")
+                print("Falling back to HF custom LLM backend")
+                self._init_custom_llm()
+
+    def _discover_vllm_generate_target(self, handler: Any) -> Optional[Any]:
+        """Find an object exposing a vLLM-like `.generate(...)` method."""
+        if handler is None:
+            return None
+
+        if hasattr(handler, "generate") and callable(getattr(handler, "generate")):
+            return handler
+
+        candidate_attrs = (
+            "_llm", "llm", "_engine", "engine", "_model", "model", "_client", "client"
+        )
+        for attr_name in candidate_attrs:
+            candidate = getattr(handler, attr_name, None)
+            if candidate is not None and hasattr(candidate, "generate") and callable(getattr(candidate, "generate")):
+                return candidate
+
+        return None
+
+    def _extract_generated_text(self, raw_output: Any) -> str:
+        """Extract generated text from varying HF/vLLM response shapes."""
+        if raw_output is None:
+            return ""
+
+        if isinstance(raw_output, str):
+            return raw_output
+
+        if isinstance(raw_output, list):
+            if not raw_output:
+                return ""
+
+            first = raw_output[0]
+            if isinstance(first, dict):
+                if "generated_text" in first:
+                    generated = first["generated_text"]
+                    if isinstance(generated, list) and generated and isinstance(generated[-1], dict):
+                        return generated[-1].get("content", "")
+                    if isinstance(generated, str):
+                        return generated
+                if "text" in first:
+                    return str(first["text"])
+
+            if hasattr(first, "outputs") and first.outputs:
+                out0 = first.outputs[0]
+                if hasattr(out0, "text"):
+                    return str(out0.text)
+
+            return str(first)
+
+        if isinstance(raw_output, dict):
+            if "generated_text" in raw_output:
+                return str(raw_output["generated_text"])
+            if "text" in raw_output:
+                return str(raw_output["text"])
+
+        if hasattr(raw_output, "outputs") and raw_output.outputs:
+            out0 = raw_output.outputs[0]
+            if hasattr(out0, "text"):
+                return str(out0.text)
+
+        return str(raw_output)
+
+    def _build_chat_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """Build plain prompt text from chat messages for backends without native chat mode."""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+
+        system_prompt = messages[0].get("content", "") if messages else ""
+        user_prompt = messages[1].get("content", "") if len(messages) > 1 else ""
+        return f"System:\n{system_prompt}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
+
+    def _generate_with_custom_backend(self, messages: List[Dict[str, str]], max_new_tokens: int) -> str:
+        """Generate text with HF pipeline or vLLM handler while tolerating API differences."""
+        def _build_vllm_sampling_params(max_tokens: int):
+            from vllm import SamplingParams
+            return SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max_tokens,
+                seed=self.vllm_seed,
+            )
+
+        if self.pipe is not None:
+            outputs = self.pipe(
+                messages,
+                max_new_tokens=max_new_tokens,
+                num_return_sequences=1,
+                do_sample=False,
+            )
+            return self._extract_generated_text(outputs)
+
+        if self.vllm_handler is None:
+            if self.vllm_llm is None:
+                raise RuntimeError("No custom LLM backend initialized")
+
+        prompt = self._build_chat_prompt(messages)
+
+        if self.vllm_llm is not None:
+            sampling_params = _build_vllm_sampling_params(max_new_tokens)
+            raw_output = self.vllm_llm.generate(
+                [prompt],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+            text = self._extract_generated_text(raw_output)
+            if text:
+                return text
+
+            raise RuntimeError("Native vLLM generation returned empty text")
+
+        self.vllm_generate_target = self.vllm_generate_target or self._discover_vllm_generate_target(self.vllm_handler)
+        attempts = []
+
+        underlying_llm = self.vllm_generate_target or getattr(self.vllm_handler, "_llm", None)
+        if underlying_llm is not None and hasattr(underlying_llm, "generate"):
+            attempts.append(("_llm.generate", ([prompt],), {}))
+
+        if hasattr(self.vllm_handler, "chat"):
+            attempts.append(("chat", (), {"messages": messages, "max_new_tokens": max_new_tokens}))
+            attempts.append(("chat", (messages,), {"max_new_tokens": max_new_tokens}))
+
+        if hasattr(self.vllm_handler, "run_llm"):
+            attempts.append(("run_llm", (prompt,), {"max_new_tokens": max_new_tokens}))
+            attempts.append(("run_llm", (prompt,), {}))
+
+        if hasattr(self.vllm_handler, "generate"):
+            attempts.append(("generate", (prompt,), {"max_new_tokens": max_new_tokens}))
+            attempts.append(("generate", ([prompt],), {"max_new_tokens": max_new_tokens}))
+
+        if callable(self.vllm_handler):
+            attempts.append(("__call__", (prompt,), {"max_new_tokens": max_new_tokens}))
+
+        last_error = None
+        tried_methods = []
+        for method_name, method_args, method_kwargs in attempts:
+            tried_methods.append(method_name)
+            try:
+                if method_name == "_llm.generate":
+                    sampling_params = _build_vllm_sampling_params(max_new_tokens)
+                    raw_output = underlying_llm.generate(
+                        method_args[0],
+                        sampling_params=sampling_params,
+                        use_tqdm=False,
+                    )
+                else:
+                    method = self.vllm_handler if method_name == "__call__" else getattr(self.vllm_handler, method_name)
+                    if method_kwargs:
+                        try:
+                            sig = inspect.signature(method)
+                            accepted_kwargs = {
+                                key: value for key, value in method_kwargs.items() if key in sig.parameters
+                            }
+                        except Exception:
+                            accepted_kwargs = method_kwargs
+                    else:
+                        accepted_kwargs = method_kwargs
+
+                    raw_output = method(*method_args, **accepted_kwargs)
+
+                text = self._extract_generated_text(raw_output)
+                if text:
+                    return text
+            except Exception as e:
+                last_error = e
+
+        if not attempts:
+            raise RuntimeError(
+                "No compatible generation method found on vLLM handler. "
+                f"Handler type: {type(self.vllm_handler)}; attrs={list(vars(self.vllm_handler).keys()) if hasattr(self.vllm_handler, '__dict__') else 'n/a'}"
+            )
+
+        raise RuntimeError(
+            "All vLLM generation attempts failed or returned empty text. "
+            f"Tried methods: {tried_methods}. Last error: {last_error}"
+        )
+
+    def _fit_filter_passages_to_context(self, query: str, passages: Dict[str, str]) -> Dict[str, str]:
+        """Shrink filter passages so prompt fits model context window."""
+        return fit_filter_passages_to_context(
+            query=query,
+            passages=passages,
+            prompts=self.prompts,
+            tokenizer=self.tokenizer,
+            context_size=CONTEXT_SIZE,
+            filter_topk=self.filter_topk,
+        )
 
     def _init_bert_model(self):
         """Initialize BERT model for filtering."""
@@ -235,6 +463,10 @@ class FilterStage:
         self.bert_tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.bert_model = AutoModel.from_pretrained(model_path).to(self.device)
         print("BERT model loaded successfully")
+
+    def _ensure_bert_loaded(self):
+        if self.bert_tokenizer is None or self.bert_model is None:
+            self._init_bert_model()
 
     def _init_rankllm_pointwise(self):
         """Initialize RankLLM pointwise reranker."""
@@ -247,28 +479,56 @@ class FilterStage:
             # PointwiseRankLLM for pointwise ranking
             # Local model directory
             llm_root = os.environ.get("LLM_MODELS_ROOT")
-            self.rankllm_reranker = MonoT5(
-                model_path=os.path.join(llm_root, "monot5-base-msmarco-10k") if llm_root else "models/monot5-base-msmarco-10k",
+            self.rankllm_filter = Reranker(MonoT5(
+                model=os.path.join(llm_root, "monot5-base-msmarco-10k") if llm_root else "models/monot5-base-msmarco-10k",
                 context_size=CONTEXT_SIZE,
-                num_gpus=NUM_GPUS,
                 device=self.device,
-            )
+            ))
             print("RankLLM pointwise reranker loaded successfully")
         except Exception as e:
             print(f"Error initializing RankLLM pointwise reranker: {e}")
             print("Falling back to custom LLM")
-            self.rankllm_reranker = None
+            self.rankllm_filter = None
+
+    def _init_rankllm_custom(self):
+        """Initialize RankLLM custom filter."""
+        if not RANK_LLM_AVAILABLE:
+            print("Warning: rank_llm not available, cannot initialize custom filter")
+            return
+
+        print("Loading RankLLM custom filter")
+        window_size = self.args.bm25_topk
+        try:
+            model_path, max_length, quantization_config = create_model_config(self.args.custom_model, CONTEXT_SIZE)
+            self.rankllm_filter = FilterListwiseOSLLM(
+                model=model_path,
+                window_size=window_size,
+                stride=self.args.listwise_stride,
+                n_keep=self.filter_topk,
+                strict_exact_n=True,
+                context_size=CONTEXT_SIZE,
+                num_gpus=NUM_GPUS,
+                device=self.device,
+                gpu_memory_utilization=0.75,
+            )
+            print("RankLLM custom filter loaded successfully")
+        except Exception as e:
+            print(f"Error initializing RankLLM custom filter: {e}")
+            print("Falling back to custom LLM")
+            self.rankllm_filter = None
 
     def filter(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Run the filter stage and return a relevance score dict."""
         start_time = time.time()
 
-        if self.filter_method == "custom_llm":
+        if self.filter_method in ("custom_llm", "custom_llm_vllm"):
             result = self._filter_custom_llm(query, passages)
         elif self.filter_method == "bert_index":
             result = self._filter_bert(query, passages)
         elif self.filter_method == "pointwise":
             result = self._filter_pointwise(query, passages, qid)
+        elif self.filter_method == "RankLLM_custom":
+            result = self._filter_rankllm_custom(query, passages, qid)
         else:
             raise ValueError(f"Unknown filter method: {self.filter_method}")
 
@@ -278,6 +538,7 @@ class FilterStage:
 
     def _filter_custom_llm(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
         """Filter using custom LLM with prompts."""
+        passages = self._fit_filter_passages_to_context(query, passages)
         plist_s = {str(i): passage for i, passage in enumerate(passages.values())}
         passage_ids = list(passages.keys())
 
@@ -289,11 +550,13 @@ class FilterStage:
                 f"{self.prompts['U-prompt-3']}"
             }
         ]
-
+        
         try:
-            outputs = self.pipe(messages, max_new_tokens=10*self.filter_topk+10,
-                               num_return_sequences=1, do_sample=False)
-            llm_rep = outputs[0]['generated_text'][-1]['content']
+            llm_rep = self._generate_with_custom_backend(
+                messages,
+                max_new_tokens=10*self.filter_topk+10,
+            )
+            print(f"\n\nRaw LLM output for filtering:\n{llm_rep}")
 
             llm_rep = llm_rep.split("{")[1]
             if '}' in llm_rep:
@@ -318,8 +581,9 @@ class FilterStage:
 
     def _filter_bert(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
         """Filter using BERT similarity."""
+        self._ensure_bert_loaded()
         query_inputs = self.bert_tokenizer(query, return_tensors="pt",
-                                          truncation=True, padding=True).to('cuda')
+                                          truncation=True, padding=True).to(self.device)
         with torch.no_grad():
             query_outputs = self.bert_model(**query_inputs)
             query_embedding = query_outputs.last_hidden_state[:, 0, :].cpu()
@@ -327,7 +591,7 @@ class FilterStage:
         similarities = {}
         for doc_id, passage_text in passages.items():
             passage_inputs = self.bert_tokenizer(passage_text, return_tensors="pt",
-                                                truncation=True, padding=True).to('cuda')
+                                                truncation=True, padding=True).to(self.device)
             with torch.no_grad():
                 passage_outputs = self.bert_model(**passage_inputs)
                 passage_embedding = passage_outputs.last_hidden_state[:, 0, :].cpu()
@@ -341,7 +605,7 @@ class FilterStage:
 
     def _filter_pointwise(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
         """Filter using Pointwise from rank_llm."""
-        if not RANK_LLM_AVAILABLE or self.rankllm_reranker is None:
+        if not RANK_LLM_AVAILABLE or self.rankllm_filter is None:
             print("Pointwise filtering not available, falling back to BERT")
             return self._filter_bert(query, passages)
 
@@ -349,12 +613,25 @@ class FilterStage:
             # Convert to RankLLM format
             request = _convert_to_rankllm_request(query, passages, qid)
             
-            # Rerank using RankLLM
-            result = self.rankllm_reranker.rerank(
-                request=request,
-                rank_start=0,
-                rank_end=len(passages)
-            )
+            # Rerank using RankLLM (handle API differences)
+            result = None
+            if hasattr(self.rankllm_filter, "rerank"):
+                result = self.rankllm_filter.rerank(
+                    request=request,
+                    rank_start=0,
+                    rank_end=len(passages)
+                )
+            elif hasattr(self.rankllm_filter, "rank"):
+                result = self.rankllm_filter.rank(
+                    request=request,
+                    rank_start=0,
+                    rank_end=len(passages)
+                )
+            elif callable(self.rankllm_filter):
+                result = self.rankllm_filter(request)
+
+            if result is None:
+                raise AttributeError("RankLLM pointwise reranker exposes no ranking method (rerank/rank/__call__)")
             
             # Convert back to our format
             return _convert_from_rankllm_result(result)
@@ -363,16 +640,49 @@ class FilterStage:
             print(f"Error in RankLLM pointwise filtering: {e}")
             print("Falling back to BERT filtering")
             return self._filter_bert(query, passages)
+        
+    def _filter_rankllm_custom(self, query: str, passages: Dict[str, str], qid: str) -> Dict[str, float]:
+        """Filter using custom filter from rank_llm."""
+        if not RANK_LLM_AVAILABLE or self.rankllm_filter is None:
+            print("Custom filtering not available, falling back to BERT")
+            return self._filter_bert(query, passages)
+
+        try:
+            # Convert to RankLLM format
+            request = _convert_to_rankllm_request(query, passages, qid)
+            
+            # Rerank using RankLLM (handle API differences)
+            result = None
+            
+            result = self.rankllm_filter.rerank_batch(
+                requests=[request],
+                rank_start=0,
+                rank_end=len(passages)
+            )
+
+            if result is None:
+                raise AttributeError("RankLLM custom filter exposes no ranking method (rerank/rank/__call__)")
+            
+            # Convert back to our format
+            return _convert_from_rankllm_result(result)
+        
+        except Exception as e:
+            print(f"Error in RankLLM custom filtering: {e}")
+            print("Falling back to BERT filtering")
+            return self._filter_bert(query, passages)
 
     def export_shared_llm(self) -> Optional[Dict[str, object]]:
         """Expose custom LLM components for reuse by ranking stage."""
-        if self.filter_method != "custom_llm":
+        if self.filter_method not in ("custom_llm", "custom_llm_vllm"):
             return None
         return {
             "pipe": self.pipe,
             "model": self.model,
             "tokenizer": self.tokenizer,
             "max_length": self.max_length,
+            "vllm_llm": self.vllm_llm,
+            "vllm_handler": self.vllm_handler,
+            "vllm_generate_target": self.vllm_generate_target,
         }
 
 
@@ -389,6 +699,10 @@ class RankingStage:
         self.tokenizer = None
         self.model = None
         self.pipe = None
+        self.vllm_llm = None
+        self.vllm_handler = None
+        self.vllm_generate_target = None
+        self.vllm_seed = int(getattr(args, "vllm_seed", 0))
         
         # RankLLM rerankers
         self.rankllm_reranker = None
@@ -400,36 +714,36 @@ class RankingStage:
 
     def _init_models(self, shared_custom_llm: Optional[Dict[str, object]]):
         """Initialize ranking models based on configuration."""
-        if self.ranking_method == "custom_llm":
-            if shared_custom_llm and shared_custom_llm.get("pipe"):
+        if self.ranking_method in ("custom_llm", "custom_llm_vllm"):
+            if shared_custom_llm and (
+                shared_custom_llm.get("pipe")
+                or shared_custom_llm.get("vllm_handler")
+                or shared_custom_llm.get("vllm_llm")
+            ):
                 print("Reusing custom LLM from filter stage for ranking")
                 self.pipe = shared_custom_llm.get("pipe")
                 self.model = shared_custom_llm.get("model")
                 self.tokenizer = shared_custom_llm.get("tokenizer")
                 self.max_length = shared_custom_llm.get("max_length")
+                self.vllm_llm = shared_custom_llm.get("vllm_llm")
+                self.vllm_handler = shared_custom_llm.get("vllm_handler")
+                self.vllm_generate_target = shared_custom_llm.get("vllm_generate_target")
             else:
-                self._init_custom_llm()
+                if self.ranking_method == "custom_llm_vllm":
+                    self._init_custom_llm_vllm()
+                else:
+                    self._init_custom_llm()
         elif self.ranking_method == "listwise":
             if self.args.listwise_model == "custom_llm":
-                if shared_custom_llm and shared_custom_llm.get("pipe"):
-                    print("Reusing custom LLM from filter stage for RankLLM listwise reranker")
-                    model = shared_custom_llm.get("model")
-                else:
-                    model_path, max_length, quantization_config = create_model_config(self.args.custom_model)
-                    model = AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        device_map="auto",
-                        quantization_config=quantization_config,
-                        max_length=max_length,
-                    )
+                model_path, max_length, quantization_config = create_model_config(self.args.custom_model, CONTEXT_SIZE)
             else:
-                model = None
-            self._init_rankllm_listwise(model=model)
+                model_path = None
+            self._init_rankllm_listwise(model=model_path)
 
     def _init_custom_llm(self):
         """Initialize custom LLM model for ranking."""
         print(f"Loading custom LLM for ranking stage: {self.args.custom_model}")
-        model_path, max_length, quantization_config = create_model_config(self.args.custom_model)
+        model_path, max_length, quantization_config = create_model_config(self.args.custom_model, CONTEXT_SIZE)
 
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -445,7 +759,261 @@ class RankingStage:
             model=self.model,
             tokenizer=self.tokenizer,
         )
+        self.vllm_llm = None
+        self.vllm_handler = None
+        self.vllm_generate_target = None
         print("Custom LLM (ranking) loaded successfully")
+
+    def _init_custom_llm_vllm(self):
+        """Initialize custom LLM model for ranking using rank_llm vLLM handler."""
+        print(f"Loading custom LLM vLLM backend for ranking stage: {self.args.custom_model}")
+        model_path, max_length, quantization_config = create_model_config(self.args.custom_model, CONTEXT_SIZE)
+        self.max_length = max_length
+
+        try:
+            from vllm import LLM
+            self.vllm_llm = LLM(
+                model=model_path,
+                tensor_parallel_size=NUM_GPUS,
+                gpu_memory_utilization=0.75,
+                trust_remote_code=True,
+                max_model_len=CONTEXT_SIZE,
+                seed=self.vllm_seed,
+                enforce_eager=False,
+                disable_log_stats=True,
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model = None
+            self.pipe = None
+            self.vllm_handler = None
+            self.vllm_generate_target = self.vllm_llm
+            print("Custom native vLLM backend (ranking) loaded successfully")
+        except Exception as e:
+            print(f"Warning: direct vLLM init failed, trying RankLLM VllmHandler fallback: {e}")
+            self.vllm_llm = None
+
+            if not RANK_LLM_AVAILABLE:
+                print("Warning: rank_llm not available, falling back to HF custom_llm")
+                self._init_custom_llm()
+                return
+
+            try:
+                from rank_llm.rerank.vllm_handler import VllmHandler
+
+                self.vllm_handler = VllmHandler(
+                    model=model_path,
+                    download_dir=os.getenv("HF_HOME"),
+                    enforce_eager=False,
+                    max_logprobs=30,
+                    tensor_parallel_size=NUM_GPUS,
+                    gpu_memory_utilization=0.75,
+                    trust_remote_code=True,
+                    max_model_len=CONTEXT_SIZE,
+                    disable_log_stats=True,
+                )
+                self.tokenizer = self.vllm_handler.get_tokenizer()
+                self.model = None
+                self.pipe = None
+                self.vllm_generate_target = self._discover_vllm_generate_target(self.vllm_handler)
+                print("Custom RankLLM vLLM backend (ranking) loaded successfully")
+                if self.vllm_generate_target is None:
+                    print("Warning: no direct generate target discovered on VllmHandler at init")
+            except Exception as e2:
+                print(f"Error initializing custom LLM vLLM backend: {e2}")
+                print("Falling back to HF custom LLM backend")
+                self._init_custom_llm()
+
+    def _discover_vllm_generate_target(self, handler: Any) -> Optional[Any]:
+        """Find an object exposing a vLLM-like `.generate(...)` method."""
+        if handler is None:
+            return None
+
+        if hasattr(handler, "generate") and callable(getattr(handler, "generate")):
+            return handler
+
+        candidate_attrs = (
+            "_llm", "llm", "_engine", "engine", "_model", "model", "_client", "client"
+        )
+        for attr_name in candidate_attrs:
+            candidate = getattr(handler, attr_name, None)
+            if candidate is not None and hasattr(candidate, "generate") and callable(getattr(candidate, "generate")):
+                return candidate
+
+        return None
+
+    def _extract_generated_text(self, raw_output: Any) -> str:
+        """Extract generated text from varying HF/vLLM response shapes."""
+        if raw_output is None:
+            return ""
+
+        if isinstance(raw_output, str):
+            return raw_output
+
+        if isinstance(raw_output, list):
+            if not raw_output:
+                return ""
+
+            first = raw_output[0]
+            if isinstance(first, dict):
+                if "generated_text" in first:
+                    generated = first["generated_text"]
+                    if isinstance(generated, list) and generated and isinstance(generated[-1], dict):
+                        return generated[-1].get("content", "")
+                    if isinstance(generated, str):
+                        return generated
+                if "text" in first:
+                    return str(first["text"])
+
+            if hasattr(first, "outputs") and first.outputs:
+                out0 = first.outputs[0]
+                if hasattr(out0, "text"):
+                    return str(out0.text)
+
+            return str(first)
+
+        if isinstance(raw_output, dict):
+            if "generated_text" in raw_output:
+                return str(raw_output["generated_text"])
+            if "text" in raw_output:
+                return str(raw_output["text"])
+
+        if hasattr(raw_output, "outputs") and raw_output.outputs:
+            out0 = raw_output.outputs[0]
+            if hasattr(out0, "text"):
+                return str(out0.text)
+
+        return str(raw_output)
+
+    def _build_chat_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """Build plain prompt text from chat messages for backends without native chat mode."""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+
+        system_prompt = messages[0].get("content", "") if messages else ""
+        user_prompt = messages[1].get("content", "") if len(messages) > 1 else ""
+        return f"System:\n{system_prompt}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
+
+    def _generate_with_custom_backend(self, messages: List[Dict[str, str]], max_new_tokens: int) -> str:
+        """Generate text with HF pipeline or vLLM handler while tolerating API differences."""
+        def _build_vllm_sampling_params(max_tokens: int):
+            from vllm import SamplingParams
+            return SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max_tokens,
+                seed=self.vllm_seed,
+            )
+
+        if self.pipe is not None:
+            outputs = self.pipe(
+                messages,
+                max_new_tokens=max_new_tokens,
+                num_return_sequences=1,
+                do_sample=False,
+            )
+            return self._extract_generated_text(outputs)
+
+        if self.vllm_handler is None:
+            if self.vllm_llm is None:
+                raise RuntimeError("No custom LLM backend initialized")
+
+        prompt = self._build_chat_prompt(messages)
+
+        if self.vllm_llm is not None:
+            sampling_params = _build_vllm_sampling_params(max_new_tokens)
+            raw_output = self.vllm_llm.generate(
+                [prompt],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+            text = self._extract_generated_text(raw_output)
+            if text:
+                return text
+
+            raise RuntimeError("Native vLLM generation returned empty text")
+
+        self.vllm_generate_target = self.vllm_generate_target or self._discover_vllm_generate_target(self.vllm_handler)
+        attempts = []
+
+        underlying_llm = self.vllm_generate_target or getattr(self.vllm_handler, "_llm", None)
+        if underlying_llm is not None and hasattr(underlying_llm, "generate"):
+            attempts.append(("_llm.generate", ([prompt],), {}))
+
+        if hasattr(self.vllm_handler, "chat"):
+            attempts.append(("chat", (), {"messages": messages, "max_new_tokens": max_new_tokens}))
+            attempts.append(("chat", (messages,), {"max_new_tokens": max_new_tokens}))
+
+        if hasattr(self.vllm_handler, "run_llm"):
+            attempts.append(("run_llm", (prompt,), {"max_new_tokens": max_new_tokens}))
+            attempts.append(("run_llm", (prompt,), {}))
+
+        if hasattr(self.vllm_handler, "generate"):
+            attempts.append(("generate", (prompt,), {"max_new_tokens": max_new_tokens}))
+            attempts.append(("generate", ([prompt],), {"max_new_tokens": max_new_tokens}))
+
+        if callable(self.vllm_handler):
+            attempts.append(("__call__", (prompt,), {"max_new_tokens": max_new_tokens}))
+
+        last_error = None
+        tried_methods = []
+        for method_name, method_args, method_kwargs in attempts:
+            tried_methods.append(method_name)
+            try:
+                if method_name == "_llm.generate":
+                    sampling_params = _build_vllm_sampling_params(max_new_tokens)
+                    raw_output = underlying_llm.generate(
+                        method_args[0],
+                        sampling_params=sampling_params,
+                        use_tqdm=False,
+                    )
+                else:
+                    method = self.vllm_handler if method_name == "__call__" else getattr(self.vllm_handler, method_name)
+                    if method_kwargs:
+                        try:
+                            sig = inspect.signature(method)
+                            accepted_kwargs = {
+                                key: value for key, value in method_kwargs.items() if key in sig.parameters
+                            }
+                        except Exception:
+                            accepted_kwargs = method_kwargs
+                    else:
+                        accepted_kwargs = method_kwargs
+
+                    raw_output = method(*method_args, **accepted_kwargs)
+
+                text = self._extract_generated_text(raw_output)
+                if text:
+                    return text
+            except Exception as e:
+                last_error = e
+
+        if not attempts:
+            raise RuntimeError(
+                "No compatible generation method found on vLLM handler. "
+                f"Handler type: {type(self.vllm_handler)}; attrs={list(vars(self.vllm_handler).keys()) if hasattr(self.vllm_handler, '__dict__') else 'n/a'}"
+            )
+
+        raise RuntimeError(
+            "All vLLM generation attempts failed or returned empty text. "
+            f"Tried methods: {tried_methods}. Last error: {last_error}"
+        )
+
+    def _fit_ranking_passages_to_context(self, query: str, passages: Dict[str, str]) -> Dict[str, str]:
+        """Shrink ranking passages so prompt fits model context window."""
+        return fit_ranking_passages_to_context(
+            query=query,
+            passages=passages,
+            prompts=self.prompts,
+            tokenizer=self.tokenizer,
+            context_size=CONTEXT_SIZE,
+        )
     
     def _init_rankllm_listwise(self, model: Optional[str] = None):
         """Initialize RankLLM listwise reranker."""
@@ -491,7 +1059,31 @@ class RankingStage:
                     window_size=window_size,
                     stride=self.args.listwise_stride,
                 )
+                # from monkeypatch import RankListwiseOSLLM_Capped
+                # self.rankllm_reranker = RankListwiseOSLLM_Capped(
+                #     model=model,
+                #     context_size=CONTEXT_SIZE,
+                #     num_gpus=NUM_GPUS,
+                #     device=self.device,
+                #     window_size=window_size,
+                #     stride=self.args.listwise_stride,
+                #     gpu_memory_utilization=0.75,
+                # )
             print("RankLLM listwise reranker loaded successfully")
+
+            if self.args.listwise_model.lower() in ("zephyr", "vicuna"):
+                reranker_obj = getattr(self.rankllm_reranker, "_reranker", None)
+                tokenizer_obj = getattr(reranker_obj, "_tokenizer", None) if reranker_obj is not None else None
+                effective_context_size = getattr(reranker_obj, "_context_size", None) if reranker_obj is not None else None
+                tokenizer_max_len = getattr(tokenizer_obj, "model_max_length", None) if tokenizer_obj is not None else None
+
+                print(
+                    "[startup] effective listwise context | "
+                    f"model={self.args.listwise_model} | "
+                    f"requested_context_size={CONTEXT_SIZE} | "
+                    f"reranker_context_size={effective_context_size} | "
+                    f"tokenizer_model_max_length={tokenizer_max_len}"
+                )
         except Exception as e:
             print(f"Error initializing RankLLM listwise reranker: {e}")
             print("Falling back to custom LLM")
@@ -501,7 +1093,7 @@ class RankingStage:
         """Run the ranking stage and return rank scores."""
         start_time = time.time()
 
-        if self.ranking_method == "custom_llm":
+        if self.ranking_method in ("custom_llm", "custom_llm_vllm"):
             result = self._rank_custom_llm(query, filtered_passages)
         elif self.ranking_method == "listwise":
             result = self._rank_rankllm_listwise(query, filtered_passages, qid)
@@ -514,6 +1106,7 @@ class RankingStage:
 
     def _rank_custom_llm(self, query: str, passages: Dict[str, str]) -> Dict[str, float]:
         """Rank using custom LLM with prompts."""
+        passages = self._fit_ranking_passages_to_context(query, passages)
         messages = [
             {"role": "system", "content": self.prompts['rerank-S-prompt']},
             {"role": "user", "content":
@@ -524,9 +1117,10 @@ class RankingStage:
         ]
 
         try:
-            outputs = self.pipe(messages, max_new_tokens=10*len(passages)+10,
-                               num_return_sequences=1, do_sample=False)
-            llm_rep = outputs[0]['generated_text'][-1]['content']
+            llm_rep = self._generate_with_custom_backend(
+                messages,
+                max_new_tokens=10*len(passages)+10,
+            )
 
             llm_rep = llm_rep.split("[")[1].split("]")[0].replace(' ', '').split(",")
 
@@ -548,16 +1142,31 @@ class RankingStage:
             return self._rank_custom_llm(query, passages)
 
         try:
+            if self.args.listwise_model != "custom_llm":
+                passages = _truncate_passages_for_rankllm(query, passages, self.rankllm_reranker)
+
             # Convert to RankLLM format
             request = _convert_to_rankllm_request(query, passages, qid)
             
-            # Rerank using RankLLM
-            result = self.rankllm_reranker.rerank(
-                request=request,
-                rank_start=0,
-                rank_end=len(passages)
-            )
-            
+            # Rerank using RankLLM while tolerating API differences between versions
+            result = None
+            if self.args.listwise_model != "custom_llm":
+                result = self.rankllm_reranker.rerank(
+                    request=request,
+                    rank_start=0,
+                    rank_end=len(passages)
+                )
+            else:
+                result = self.rankllm_reranker.rerank_batch(
+                    requests=[request],
+                    rank_start=0,
+                    rank_end=len(passages)
+                )
+            # print(f"Parsed RankLLM output: {result}")
+
+            if result is None:
+                raise AttributeError("RankLLM reranker exposes no ranking method (rerank/rank/__call__)")
+
             # Convert back to our format
             return _convert_from_rankllm_result(result)
         except Exception as e:
@@ -684,6 +1293,8 @@ def save_rundict(rundict: Dict, output_path: str):
 def main():
     """Main execution function."""
     args = get_args()
+    if args.custom_model in ("zephyr", "vicuna") and args.listwise_model == "custom_llm" :
+        args.listwise_model = args.custom_model  # Use same model for listwise if specified as custom
     print(f"Configuration: {args}")
     
     # Create output directory
@@ -716,9 +1327,7 @@ def main():
     # Load dataset
     print(f"\nLoading dataset: {args.dataset}")
     try:
-        corpus, queries, qrels = GenericDataLoader(f"datasets/{args.dataset}").load(split="test")
-        corpus = {k: v['text'] if isinstance(v, dict) else v for k, v in corpus.items()}
-        print(f"Loaded {len(corpus)} documents, {len(queries)} queries, {len(qrels)} qrels")
+        _, _, qrels = load_dataset(args.dataset)
     except Exception as e:
         print(f"Error loading dataset: {e}")
         print("Please ensure the dataset is available in datasets/ directory")
@@ -736,24 +1345,43 @@ def main():
     emissions_dir = os.path.join(args.output_dir, 'emissions')
     os.makedirs(emissions_dir, exist_ok=True)
 
-    if args.stage == "rerank" and not args.load_filtered_rundict:
-        filter_method_name = "Direct"
+    if args.stage == "rerank":
+        if args.load_filtered_rundict:
+            filter_method_name = os.path.basename(args.load_filtered_rundict).split("_")[2]  # Extract filter method from filename
+            filter_number = f"filter{args.filter_topk}"
+        else:
+            filter_method_name = "Direct"
+            filter_number = f"filter{args.bm25_topk}"
     elif args.filter_method == "custom_llm":
         filter_method_name = f"CustomLLM-{args.custom_model}"
+        filter_number = f"filter{args.filter_topk}"
+    elif args.filter_method == "custom_llm_vllm":
+        filter_method_name = f"CustomLLM-vLLM-{args.custom_model}"
+        filter_number = f"filter{args.filter_topk}"
     elif args.filter_method == "pointwise":
         filter_method_name = "Pointwise"
+        filter_number = f"filter{args.bm25_topk}"
     elif args.filter_method == "bert_index":
         filter_method_name = f"BERT-{args.bert_model}"
+        filter_number = f"filter{args.bm25_topk}"
+    elif args.filter_method == "RankLLM_custom":
+        filter_method_name = f"RankLLM-{args.custom_model}"
+        filter_number = f"filter{args.filter_topk}"
 
     if args.stage == "filter":
-        ranking_method_name = "N/A"
+        ranking_method_name = "No-Rerank"
     elif args.ranking_method == "custom_llm":
         ranking_method_name = f"CustomLLM-{args.custom_model}"
+    elif args.ranking_method == "custom_llm_vllm":
+        ranking_method_name = f"CustomLLM-vLLM-{args.custom_model}"
     elif args.ranking_method == "listwise":
-        ranking_method_name = f"Listwise-{args.listwise_model}-W{args.listwise_window_size}-S{args.listwise_stride}"
+        if args.listwise_model == "custom_llm":
+            ranking_method_name = f"Listwise-{args.custom_model}-W{args.listwise_window_size}-S{args.listwise_stride}"
+        else:
+            ranking_method_name = f"Listwise-{args.listwise_model}-W{args.listwise_window_size}-S{args.listwise_stride}"
 
     filter_emissions_file = (
-        f"emissions_filter_{args.dataset}_{filter_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.csv"
+        f"emissions_filter_{args.dataset}_{filter_method_name}_{filter_number}_top{args.bm25_topk}.csv"
     )
     ranking_emissions_file = (
         f"emissions_ranking_{args.dataset}_{ranking_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.csv"
@@ -765,13 +1393,13 @@ def main():
     filtered_rundict = None
     filter_engine = None
 
-    queries_to_process = [qid for qid in qrels.keys() if qid in queries]
+    queries_to_process = [qid for qid in qrels.keys() if qid in queries_with_passages]
     print(f"Processing {len(queries_to_process)} queries")
 
     filtered_output_path = os.path.join(
         args.output_dir,
         "rundicts",
-        f"filtered_{args.dataset}_{filter_method_name}_filter{args.filter_topk}_top{args.bm25_topk}.json"
+        f"filtered_{args.dataset}_{filter_method_name}_{filter_number}_top{args.bm25_topk}.json"
     )
 
     ranking_output_path = os.path.join(
@@ -796,7 +1424,10 @@ def main():
 
         filtered_rundict = {}
         for qid in tqdm(queries_to_process, desc="Filtering queries"):
-            query_text = queries[qid]
+            query_text = queries_with_passages[qid]['query']
+            corpus = queries_with_passages[qid]['passages']
+            corpus_texts = list(corpus.values())
+            corpus_ids = list(corpus.keys())
 
             if str(qid) not in bm25_rundict and qid not in bm25_rundict:
                 print(f"Warning: Query {qid} not in BM25 results")
@@ -804,12 +1435,12 @@ def main():
 
             bm25_qid = str(qid) if str(qid) in bm25_rundict else qid
             top_k_passage_ids = list(bm25_rundict[bm25_qid].keys())[:args.bm25_topk]
-
+           
             passages = {}
             for pid in top_k_passage_ids:
-                if pid in corpus:
+                if pid in corpus_ids:
                     passages[pid] = corpus[pid]
-                elif str(pid) in corpus:
+                elif str(pid) in corpus_ids:
                     passages[str(pid)] = corpus[str(pid)]
 
             if not passages:
@@ -819,31 +1450,42 @@ def main():
             try:
                 filter_scores = filter_engine.filter(query_text, passages, str(qid))
                 if not filter_scores:
+                    print(f"Warning: No filter scores returned for query {qid}")
                     continue
                 sorted_passages = sorted(filter_scores.items(), key=lambda x: x[1], reverse=True)
                 filtered_rundict[str(qid)] = {pid: score for pid, score in sorted_passages}
             except Exception as e:
                 print(f"Error filtering query {qid}: {e}")
                 continue
+        filter_avg_time = filter_engine.filter_time / max(filter_engine.filter_count, 1)
+        filter_total_time = filter_engine.filter_time
 
         tracker_filter.stop()
         save_rundict(filtered_rundict, filtered_output_path)
 
+        cleanup_stage_engine(filter_engine, "rankllm_filter")
+        filter_engine = None
+
+        import subprocess
+        print(subprocess.check_output(["nvidia-smi","--query-gpu=index,name,memory.used,memory.free","--format=csv"]).decode())
+
         # No early return here; filter-only runs will skip ranking later but still report metrics
 
     if args.stage == "rerank":
-        if not args.load_filtered_rundict:
+        if args.load_filtered_rundict:
+            load_path = args.load_filtered_rundict
+            if not os.path.exists(load_path):
+                print(f"Error: Provided filtered rundict not found at {load_path}")
+                return
+            with open(load_path, 'r', encoding='utf-8') as f:
+                filtered_rundict = json.load(f)
+        else:
             print(f"Using top{args.bm25_topk} BM25 results as filtered rundict for reranking")
+            filtered_rundict = {}
             for qid in queries_to_process:
                 bm25_qid = str(qid) if str(qid) in bm25_rundict else qid
                 top_k_passage_ids = list(bm25_rundict[bm25_qid].keys())[:args.bm25_topk]
-                filtered_rundict = {bm25_qid: {pid: bm25_rundict[bm25_qid][pid] for pid in top_k_passage_ids}}
-        elif not os.path.exists(filtered_output_path):
-            print(f"Error: Provided filtered rundict not found at {filtered_output_path}")
-            return
-        else:
-            with open(filtered_output_path, 'r', encoding='utf-8') as f:
-                filtered_rundict = json.load(f)
+                filtered_rundict[bm25_qid] = {pid: bm25_rundict[bm25_qid][pid] for pid in top_k_passage_ids}
 
     rundict_rerank = {}
 
@@ -853,7 +1495,7 @@ def main():
             return
 
         print("\nRunning ranking stage...")
-        ranking_engine = RankingStage(args, prompts, shared_custom_llm=filter_engine.export_shared_llm() if filter_engine else None)
+        ranking_engine = RankingStage(args, prompts)
         tracker_ranking = OfflineEmissionsTracker(
             country_iso_code="FRA",
             tracking_mode="process",
@@ -865,20 +1507,28 @@ def main():
         )
         tracker_ranking.start()
 
+        print(f"\n\nOUTPUT START")
         for qid in tqdm(queries_to_process, desc="Reranking queries"):
-            query_text = queries[qid]
+            query_text = queries_with_passages[qid]['query']
+            corpus = queries_with_passages[qid]['passages']
+            corpus_texts = list(corpus.values())
+            corpus_ids = list(corpus.keys())
             filtered_scores = filtered_rundict.get(str(qid)) or filtered_rundict.get(qid)
-            filtered_scores = {pid: score for pid, score in list(filtered_scores.items())[:args.filter_topk]}
             if not filtered_scores:
                 print(f"Warning: No filtered docs for query {qid}")
+                sorted_filtered = {}
                 continue
 
-            sorted_filtered = sorted(filtered_scores.items(), key=lambda x: x[1], reverse=True)
+            else:
+                # print(f"size of filtered scores before topk: {len(filtered_scores)}")
+                filtered_scores = {pid: score for pid, score in list(filtered_scores.items())[:args.filter_topk]}
+                sorted_filtered = sorted(filtered_scores.items(), key=lambda x: x[1], reverse=True)
+
             filtered_passages = {}
             for pid, _ in sorted_filtered:
-                if pid in corpus:
+                if pid in corpus_ids:
                     filtered_passages[pid] = corpus[pid]
-                elif str(pid) in corpus:
+                elif str(pid) in corpus_ids:
                     filtered_passages[str(pid)] = corpus[str(pid)]
 
             if not filtered_passages:
@@ -886,6 +1536,7 @@ def main():
                 continue
 
             try:
+                # print(f"size of filtered passages after topk: {len(filtered_passages)}")
                 final_scores = ranking_engine.rank(query_text, filtered_passages, str(qid))
                 rundict_rerank[str(qid)] = final_scores
             except Exception as e:
@@ -943,21 +1594,21 @@ def main():
                     'duration_s': float(ranking_data.get('duration', 0)),
                 }
 
-    timing_metrics = {}
-    if filter_engine:
-        timing_metrics['filter_avg_time_s'] = filter_engine.filter_time / max(filter_engine.filter_count, 1)
-        timing_metrics['filter_total_time_s'] = filter_engine.filter_time
-    else:
-        timing_metrics['filter_avg_time_s'] = 0
-        timing_metrics['filter_total_time_s'] = 0
+    # timing_metrics = {}
+    # if filter_avg_time is not None and filter_total_time is not None:
+    #     timing_metrics['filter_avg_time_s'] = filter_avg_time
+    #     timing_metrics['filter_total_time_s'] = filter_total_time
+    # else:
+    #     timing_metrics['filter_avg_time_s'] = 0
+    #     timing_metrics['filter_total_time_s'] = 0
 
-    if ranking_engine:
-        timing_metrics['ranking_avg_time_s'] = ranking_engine.ranking_time / max(ranking_engine.ranking_count, 1)
-        timing_metrics['ranking_total_time_s'] = ranking_engine.ranking_time
-    else:
-        timing_metrics['ranking_avg_time_s'] = 0
-        timing_metrics['ranking_total_time_s'] = 0
-    codecarbon_metrics['timing'] = timing_metrics
+    # if ranking_engine:
+    #     timing_metrics['ranking_avg_time_s'] = ranking_engine.ranking_time / max(ranking_engine.ranking_count, 1)
+    #     timing_metrics['ranking_total_time_s'] = ranking_engine.ranking_time
+    # else:
+    #     timing_metrics['ranking_avg_time_s'] = 0
+    #     timing_metrics['ranking_total_time_s'] = 0
+    # codecarbon_metrics['timing'] = timing_metrics
 
     print("\nCodeCarbon metrics:")
     print(json.dumps(codecarbon_metrics, indent=2))

@@ -16,7 +16,7 @@
  
 module purge
  
-module load pytorch-gpu/py3/2.3.0
+module load cuda/12.2.0
 conda activate llama
 export JAVA_HOME=/lustre/fswork/projects/rech/ahw/uep39vh/jdk-21.0.6
 export PATH=$JAVA_HOME/bin:$PATH
